@@ -242,7 +242,7 @@ class UperNetHead(nn.Module):
             )
         fpn_outs = torch.cat(fpn_outs, dim=1)  #[1, 2048, 128, 128]
         
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         # output = self.fpn_bottleneck(fpn_outs)
         output = self.upsamplerX2(fpn_outs)
         output = self.upsamplerX4(output)
