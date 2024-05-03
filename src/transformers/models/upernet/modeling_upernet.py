@@ -121,6 +121,36 @@ class UperNetPyramidPoolingModule(nn.Module):
         return ppm_outs
 
 
+
+# class Upsample(nn.Module):
+#     def __init__(self, num_features) -> None:
+#         super().__init__()
+
+#         self.convolution = nn.Conv2d(num_features, num_features, 3, 1, 1)
+#         self.pixelshuffle = nn.PixelShuffle(2)
+    
+#     def forward(self, hidden_state):
+#         hidden_state = self.convolution(hidden_state)
+#         hidden_state = self.pixelshuffle(hidden_state)
+#         return hidden_state
+
+
+class PixelShuffleUpsampler(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.conv_before_upsample = nn.Conv2d(num_features, num_features, 3, 1, 1)
+        self.activation = nn.LeakyReLU(inplace=True)
+        self.upsample = nn.PixelShuffle(2)
+        self.final_convolution = nn.Conv2d(num_features//4, num_features//4, 3, 1, 1)
+
+    def forward(self, x):
+        x = self.conv_before_upsample(x)
+        x = self.activation(x)
+        x = self.upsample(x)
+        x = self.final_convolution(x)
+        return x
+
+
 class UperNetHead(nn.Module):
     """
     Unified Perceptual Parsing for Scene Understanding. This head is the implementation of
@@ -135,7 +165,7 @@ class UperNetHead(nn.Module):
         self.in_channels = in_channels
         self.channels = config.hidden_size
         self.align_corners = False
-        self.classifier = nn.Conv2d(self.channels, config.num_labels, kernel_size=1)
+        # self.classifier = nn.Conv2d(self.channels, config.num_labels, kernel_size=1)
 
         # PSP Module
         self.psp_modules = UperNetPyramidPoolingModule(
@@ -159,12 +189,15 @@ class UperNetHead(nn.Module):
             self.lateral_convs.append(l_conv)
             self.fpn_convs.append(fpn_conv)
 
-        self.fpn_bottleneck = UperNetConvModule(
-            len(self.in_channels) * self.channels,
-            self.channels,
-            kernel_size=3,
-            padding=1,
-        )
+        # self.fpn_bottleneck = UperNetConvModule(
+        #     len(self.in_channels) * self.channels,
+        #     self.channels,
+        #     kernel_size=3,
+        #     padding=1,
+        # )
+        self.upsamplerX2 = PixelShuffleUpsampler(2048) #chenhao
+        self.upsamplerX4 = PixelShuffleUpsampler(2048 // 4)
+        self.classifier = nn.Conv2d(2048 // 4**2, config.num_labels, kernel_size=1)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -207,8 +240,12 @@ class UperNetHead(nn.Module):
             fpn_outs[i] = nn.functional.interpolate(
                 fpn_outs[i], size=fpn_outs[0].shape[2:], mode="bilinear", align_corners=self.align_corners
             )
-        fpn_outs = torch.cat(fpn_outs, dim=1)
-        output = self.fpn_bottleneck(fpn_outs)
+        fpn_outs = torch.cat(fpn_outs, dim=1)  #[1, 2048, 128, 128]
+        
+        import pdb; pdb.set_trace()
+        # output = self.fpn_bottleneck(fpn_outs)
+        output = self.upsamplerX2(fpn_outs)
+        output = self.upsamplerX4(output)
         output = self.classifier(output)
 
         return output

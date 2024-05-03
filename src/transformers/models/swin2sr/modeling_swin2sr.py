@@ -1142,6 +1142,7 @@ class Swin2SRForImageSuperResolution(Swin2SRPreTrainedModel):
                 align_corners=False,
             )
 
+        import pdb; pdb.set_trace()
         outputs = self.swin2sr(
             pixel_values,
             head_mask=head_mask,
@@ -1150,7 +1151,8 @@ class Swin2SRForImageSuperResolution(Swin2SRPreTrainedModel):
             return_dict=return_dict,
         )
 
-        sequence_output = outputs[0]
+        import pdb; pdb.set_trace()
+        sequence_output = outputs[0] #[1,3,256,256], pixel_values:[1,3,256,256]
 
         if self.upsampler in ["pixelshuffle", "pixelshuffledirect", "nearest+conv"]:
             reconstruction = self.upsample(sequence_output)
