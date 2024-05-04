@@ -244,9 +244,9 @@ class UperNetHead(nn.Module):
         
         # import pdb; pdb.set_trace()
         # output = self.fpn_bottleneck(fpn_outs)
-        output = self.upsamplerX2(fpn_outs)
-        output = self.upsamplerX4(output)
-        output = self.classifier(output)
+        output = self.upsamplerX2(fpn_outs)    #[1, 512, 256, 256]
+        output = self.upsamplerX4(output)      #[1, 128, 512, 512]
+        output = self.classifier(output)       #[1, 9, 512, 512]
 
         return output
 
@@ -442,7 +442,8 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         features = outputs.feature_maps
 
         logits = self.decode_head(features)
-        logits = nn.functional.interpolate(logits, size=pixel_values.shape[2:], mode="bilinear", align_corners=False)
+        # logits = nn.functional.interpolate(logits, size=pixel_values.shape[2:], mode="bilinear", align_corners=False)
+        #chenhao
 
         auxiliary_logits = None
         if self.auxiliary_head is not None:
