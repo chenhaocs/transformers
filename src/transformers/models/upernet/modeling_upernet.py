@@ -195,9 +195,12 @@ class UperNetHead(nn.Module):
         #     kernel_size=3,
         #     padding=1,
         # )
-        self.upsamplerX2 = PixelShuffleUpsampler(2048) #chenhao
-        self.upsamplerX4 = PixelShuffleUpsampler(2048 // 4)
-        self.classifier = nn.Conv2d(2048 // 4**2, config.num_labels, kernel_size=1)
+        # self.upsamplerX2 = PixelShuffleUpsampler(2048) #chenhao
+        # self.upsamplerX4 = PixelShuffleUpsampler(2048 // 4)
+        # self.classifier = nn.Conv2d(2048 // 4**2, config.num_labels, kernel_size=1)
+
+        self.upsamplerX2 = PixelShuffleUpsampler(1024) #chenhao
+        self.classifier = nn.Conv2d(1024 // 4, config.num_labels, kernel_size=1)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -218,9 +221,10 @@ class UperNetHead(nn.Module):
         return output
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        # import pdb; pdb.set_trace()
+
         # build laterals
         laterals = [lateral_conv(encoder_hidden_states[i]) for i, lateral_conv in enumerate(self.lateral_convs)]
-
         laterals.append(self.psp_forward(encoder_hidden_states))
 
         # build top-down path
@@ -241,11 +245,17 @@ class UperNetHead(nn.Module):
                 fpn_outs[i], size=fpn_outs[0].shape[2:], mode="bilinear", align_corners=self.align_corners
             )
         fpn_outs = torch.cat(fpn_outs, dim=1)  #[1, 2048, 128, 128]
-        
-        # import pdb; pdb.set_trace()
+        #swin-tiny: [96, 192, 384, 768] 1440
+        #swin-small: [96, 192, 384, 768] 2048
+
         # output = self.fpn_bottleneck(fpn_outs)
-        output = self.upsamplerX2(fpn_outs)    #[1, 512, 256, 256]
-        output = self.upsamplerX4(output)      #[1, 128, 512, 512]
+
+        # import pdb; pdb.set_trace()
+        # output = self.upsamplerX2(fpn_outs)    #[1, 512, 256, 256]
+        # output = self.upsamplerX4(output)      #[1, 128, 512, 512]
+        # output = self.classifier(output)       #[1, 9, 512, 512]
+
+        output = self.upsamplerX2(fpn_outs)    #[1, 512, 512, 512]
         output = self.classifier(output)       #[1, 9, 512, 512]
 
         return output

@@ -308,6 +308,7 @@ class SwinPatchEmbeddings(nn.Module):
         return pixel_values
 
     def forward(self, pixel_values: Optional[torch.FloatTensor]) -> Tuple[torch.Tensor, Tuple[int]]:
+        # import pdb; pdb.set_trace()
         _, num_channels, height, width = pixel_values.shape
         if num_channels != self.num_channels:
             raise ValueError(
@@ -445,6 +446,7 @@ class SwinSelfAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)
         self.register_buffer("relative_position_index", relative_position_index)
 
+        #self.all_head_size 96
         self.query = nn.Linear(self.all_head_size, self.all_head_size, bias=config.qkv_bias)
         self.key = nn.Linear(self.all_head_size, self.all_head_size, bias=config.qkv_bias)
         self.value = nn.Linear(self.all_head_size, self.all_head_size, bias=config.qkv_bias)
@@ -455,6 +457,8 @@ class SwinSelfAttention(nn.Module):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(new_x_shape)
         return x.permute(0, 2, 1, 3)
+        #self.num_attention_heads: 3
+        #self.attention_head_size: 32
 
     def forward(
         self,
@@ -469,11 +473,18 @@ class SwinSelfAttention(nn.Module):
         key_layer = self.transpose_for_scores(self.key(hidden_states))
         value_layer = self.transpose_for_scores(self.value(hidden_states))
         query_layer = self.transpose_for_scores(mixed_query_layer)
+        #hidden_states: [361, 49, 96]
+        #self.key(hidden_states): [361, 49, 96]
+        #query_layer: [361, 3, 49, 32]
+        #key_layer: [361, 3, 49, 32]
+        #361: 19x19, 512 / 4 / 7 = 18.29, number of windows
+
+        # import pdb; pdb.set_trace()
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        #attention_scores: [361, 3, 49, 49]
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
         relative_position_bias = relative_position_bias.view(
@@ -503,10 +514,10 @@ class SwinSelfAttention(nn.Module):
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
 
-        context_layer = torch.matmul(attention_probs, value_layer)
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        context_layer = torch.matmul(attention_probs, value_layer) #[361, 3, 49, 32]
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous() #[361, 49, 3, 32]
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(new_context_layer_shape)
+        context_layer = context_layer.view(new_context_layer_shape) #[361, 49, 96]
 
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
 
@@ -664,10 +675,10 @@ class SwinLayer(nn.Module):
 
         hidden_states = self.layernorm_before(hidden_states)
 
-        hidden_states = hidden_states.view(batch_size, height, width, channels)
+        hidden_states = hidden_states.view(batch_size, height, width, channels) #512 -> 128
 
         # pad hidden_states to multiples of window size
-        hidden_states, pad_values = self.maybe_pad(hidden_states, height, width)
+        hidden_states, pad_values = self.maybe_pad(hidden_states, height, width) #128 -> 133
 
         _, height_pad, width_pad, _ = hidden_states.shape
         # cyclic shift
@@ -676,8 +687,10 @@ class SwinLayer(nn.Module):
         else:
             shifted_hidden_states = hidden_states
 
+        # import pdb; pdb.set_trace()
+
         # partition windows
-        hidden_states_windows = window_partition(shifted_hidden_states, self.window_size)
+        hidden_states_windows = window_partition(shifted_hidden_states, self.window_size) #[361,7,7,96]
         hidden_states_windows = hidden_states_windows.view(-1, self.window_size * self.window_size, channels)
         attn_mask = self.get_attn_mask(height_pad, width_pad, dtype=hidden_states.dtype)
         if attn_mask is not None:
@@ -685,7 +698,7 @@ class SwinLayer(nn.Module):
 
         attention_outputs = self.attention(
             hidden_states_windows, attn_mask, head_mask, output_attentions=output_attentions
-        )
+        ) #hidden_states_windows: [361, 49, 96],  attention_outputs:[361, 49, 96]
 
         attention_output = attention_outputs[0]
 
@@ -1260,6 +1273,8 @@ class SwinBackbone(SwinPreTrainedModel, BackboneMixin):
         super().__init__(config)
         super()._init_backbone(config)
 
+        # import pdb; pdb.set_trace()
+
         self.num_features = [config.embed_dim] + [int(config.embed_dim * 2**i) for i in range(len(config.depths))]
         self.embeddings = SwinEmbeddings(config)
         self.encoder = SwinEncoder(config, self.embeddings.patch_grid)
@@ -1314,7 +1329,9 @@ class SwinBackbone(SwinPreTrainedModel, BackboneMixin):
         )
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
 
-        embedding_output, input_dimensions = self.embeddings(pixel_values)
+        embedding_output, input_dimensions = self.embeddings(pixel_values) # pixel_values: [1, 3, 256, 256]
+        # embedding_output: [1, 4096, 96] -> [1, 64^2, 96]
+        # import pdb; pdb.set_trace()
 
         outputs = self.encoder(
             embedding_output,
@@ -1345,6 +1362,8 @@ class SwinBackbone(SwinPreTrainedModel, BackboneMixin):
             if output_hidden_states:
                 output += (outputs.hidden_states,)
             return output
+
+        # import pdb; pdb.set_trace()
 
         return BackboneOutput(
             feature_maps=feature_maps,

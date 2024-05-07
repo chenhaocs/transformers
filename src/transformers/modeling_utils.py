@@ -2985,6 +2985,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         adapter_name = kwargs.pop("adapter_name", "default")
         use_flash_attention_2 = kwargs.pop("use_flash_attention_2", False)
 
+        # import pdb; pdb.set_trace()
+
         if is_fsdp_enabled():
             low_cpu_mem_usage = True
 
@@ -3116,6 +3118,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         if is_offline_mode() and not local_files_only:
             logger.info("Offline mode: forcing local_files_only=True")
             local_files_only = True
+
+        # import pdb; pdb.set_trace()
 
         # Load config if we don't provide a configuration
         if not isinstance(config, PretrainedConfig):
@@ -3549,6 +3553,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         with ContextManagers(init_contexts):
             # Let's make sure we don't run the init function of buffer modules
             model = cls(config, *model_args, **model_kwargs)
+
+        # import pdb; pdb.set_trace()
 
         # make sure we use the model's config since the __init__ call might have copied it
         config = model.config

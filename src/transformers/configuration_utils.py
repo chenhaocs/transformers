@@ -711,6 +711,8 @@ class PretrainedConfig(PushToHubMixin):
                     f" containing a {configuration_file} file"
                 )
 
+        # import pdb; pdb.set_trace()
+
         try:
             # Load config dict
             config_dict = cls._dict_from_json_file(resolved_config_file)

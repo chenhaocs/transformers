@@ -180,10 +180,12 @@ class Swin2SRPatchEmbeddings(nn.Module):
         self.patches_resolution = patches_resolution
         self.num_patches = patches_resolution[0] * patches_resolution[1]
 
+        # patch_size = 1
         self.projection = nn.Conv2d(num_channels, config.embed_dim, kernel_size=patch_size, stride=patch_size)
         self.layernorm = nn.LayerNorm(config.embed_dim) if normalize_patches else None
 
     def forward(self, embeddings: Optional[torch.FloatTensor]) -> Tuple[torch.Tensor, Tuple[int]]:
+        import pdb; pdb.set_trace()
         embeddings = self.projection(embeddings)
         _, _, height, width = embeddings.shape
         output_dimensions = (height, width)
@@ -890,8 +892,10 @@ class Swin2SRModel(Swin2SRPreTrainedModel):
         # some preprocessing: padding + normalization
         pixel_values = self.pad_and_normalize(pixel_values)
 
-        embeddings = self.first_convolution(pixel_values)
+        embeddings = self.first_convolution(pixel_values)  # [1, 60, 256, 256]
         embedding_output, input_dimensions = self.embeddings(embeddings)
+        # embedding_output: [1, 65536, 60] -> [1, 256^2, 60]
+        import pdb; pdb.set_trace()
 
         encoder_outputs = self.encoder(
             embedding_output,
