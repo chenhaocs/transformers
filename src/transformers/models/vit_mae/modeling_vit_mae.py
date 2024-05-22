@@ -761,8 +761,11 @@ class ViTMAEDecoder(nn.Module):
         output_hidden_states=False,
         return_dict=True,
     ):
+        
+        # import pdb; pdb.set_trace()
+
         # embed tokens
-        x = self.decoder_embed(hidden_states)
+        x = self.decoder_embed(hidden_states)  #[1, 50, 512]: 768 -> 512
 
         # append mask tokens to sequence
         mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
@@ -771,7 +774,9 @@ class ViTMAEDecoder(nn.Module):
         x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
 
         # add pos embed
-        hidden_states = x + self.decoder_pos_embed
+        hidden_states = x + self.decoder_pos_embed  # [1, 197, 512]
+
+        # import pdb; pdb.set_trace()
 
         # apply Transformer layers (blocks)
         all_hidden_states = () if output_hidden_states else None
@@ -801,7 +806,7 @@ class ViTMAEDecoder(nn.Module):
         hidden_states = self.decoder_norm(hidden_states)
 
         # predictor projection
-        logits = self.decoder_pred(hidden_states)
+        logits = self.decoder_pred(hidden_states)  #[1, 197, 768]: 512 -> 768
 
         # remove cls token
         logits = logits[:, 1:, :]
@@ -985,12 +990,15 @@ class ViTMAEForPreTraining(ViTMAEPreTrainedModel):
             return_dict=return_dict,
         )
 
-        latent = outputs.last_hidden_state
+        # import pdb ; pdb.set_trace()
+
+        latent = outputs.last_hidden_state  # [1, 50, 768]
         ids_restore = outputs.ids_restore
         mask = outputs.mask
 
         decoder_outputs = self.decoder(latent, ids_restore)
         logits = decoder_outputs.logits  # shape (batch_size, num_patches, patch_size*patch_size*num_channels)
+        # [1, 196, 768]
 
         loss = self.forward_loss(pixel_values, logits, mask)
 
