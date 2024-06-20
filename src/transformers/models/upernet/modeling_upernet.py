@@ -276,7 +276,7 @@ class UperNetHead(nn.Module):
         self.fine_mask_norm = torch.nn.LayerNorm(self.n_fine_cls)#.cuda(cuda_id)
 
         self.feat_norm = torch.nn.LayerNorm(in_channels)#.cuda(cuda_id)
-        self.conv_reduce = nn.Conv2d(self.channels, 128,kernel_size=1, stride=1, bias=False)
+        self.conv_reduce = nn.Conv2d(self.channels, 128, kernel_size=1, stride=1, bias=False)
 
         self.gamma = 0.999
         self.ppc_loss_weight = 1.0
