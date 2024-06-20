@@ -30,9 +30,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 from einops import rearrange, repeat
-from lib.models.modules.contrast import momentum_update, l2_normalize
-from lib.models.modules.sinkhorn import distributed_sinkhorn
-from lib.loss.loss_proto import PixelPrototypeCELoss
 
 
 # General docstring
@@ -214,10 +211,44 @@ class UperNetHead(nn.Module):
         ##############################################################################################
         # add prototype classifier head
         ##############################################################################################
+        c2f_classnames = {
+            'Unknown': ['Unknown'],
+            'Bareland': ['Unknown', '野外荒地', '城市荒地'],
+            'Rangeland': ['Unknown', '野外草地', '城市草地'],
+            'Developed': ['Unknown', '乡村人工开阔地', '城市人工开阔地', '体育场'],
+            'Road': ['Unknown', '田间小径', '乡村小道', '城际大道', '市区道路', '铁路', '河流桥梁', '过街天桥', '城市高架路'],
+            'Tree': ['Unknown', '野外单棵树', '野外森林', '行道树', '城市园区树木', '城市单棵树', '城市公园树林'],
+            'Water': ['Unknown', 'River', 'Lake', 'Pond', 'Fishpond', 'Swimming pool', '城市pond'],
+            'Agriculture': ['Unknown', '旱田', '水田', '果园', 'Greenhouse'],
+            'Building': ['Unknown', '乡村独栋住宅', '城市低层建筑', '城市高层建筑', '车站大楼', '商场大楼', '其他公共建筑'],
+            'Others': ['Unknown', 'Shadow', 'Vehicle'],
+        }
+
+        self.c2f_map = list()
+        self.f2c_map = list()
+
+        fine_count = 0
+        coarse_count = 0
+        for cname,fnames in c2f_classnames.items():
+            if cname.lower() == 'unknown': continue
+
+            fine_indices = list()
+            for fname in fnames:
+                if fname.lower() != 'unknown':
+                    fine_indices.append(fine_count)
+                    fine_count += 1
+            self.c2f_map.append(fine_indices)
+            self.f2c_map.append([coarse_count] * len(fine_indices))
+            coarse_count += 1
+
+        # self.c2f_map = [[0, 1], [2, 3], [4, 5, 6], [7, 8, 9, 10, 11, 12, 13, 14], [15, 16, 17, 18, 19, 20], [21, 22, 23, 24, 25, 26], [27, 28, 29, 30], [31, 32, 33, 34, 35, 36], [37, 38]]
+        # self.f2c_map = [[0, 0], [1, 1], [2, 2, 2], [3, 3, 3, 3, 3, 3, 3, 3], [4, 4, 4, 4, 4, 4], [5, 5, 5, 5, 5, 5], [6, 6, 6, 6], [7, 7, 7, 7, 7, 7], [8, 8]]
+
+
         cuda_id = 1
 
         # coarse-prototype
-        self.n_coarse_cls =10
+        self.n_coarse_cls = coarse_count
         self.n_coarse_pt  = 5
         in_channels       = 128
         self.coarse_pt = torch.nn.Parameter(
@@ -226,12 +257,12 @@ class UperNetHead(nn.Module):
                                 self.n_coarse_pt,
                                 in_channels
                             ),#.cuda(cuda_id), 
-                            requires_grad=False) #chenhao
+                            requires_grad=False)
         trunc_normal_(self.coarse_pt, std=0.02)
         self.coarse_mask_norm = torch.nn.LayerNorm(self.n_coarse_cls)#.cuda(cuda_id)
 
         # fine-prototype
-        self.n_fine_cls = 40
+        self.n_fine_cls = fine_count
         self.n_fine_pt  = 5
         in_channels     = 128
         self.fine_pt = torch.nn.Parameter(
@@ -240,7 +271,7 @@ class UperNetHead(nn.Module):
                                 self.n_fine_pt,
                                 in_channels
                             ),#.cuda(cuda_id), 
-                            requires_grad=False) #chenhao
+                            requires_grad=False)
         trunc_normal_(self.fine_pt, std=0.02)
         self.fine_mask_norm = torch.nn.LayerNorm(self.n_fine_cls)#.cuda(cuda_id)
 
@@ -253,28 +284,11 @@ class UperNetHead(nn.Module):
         self.seg_loss_weight = 1.0
         # self.ps_loss_weight  = 1.0
 
-        self.c2f_map = [
-            [0],
-            [1, 2],
-            [3, 4],
-            [5, 6, 7],
-            [8, 9, 10, 11, 12, 13, 14, 15],
-            [16, 17, 18, 19, 20, 21],
-            [22, 23, 24, 25, 26, 27],
-            [28, 29, 30, 31],
-            [32, 33, 34, 35, 36, 37],
-            [38, 39],
-        ]
-
-        from lib.utils.tools.configer import Configer
-        configer = Configer(configs='/remote-home/chenhao/code/transformers/src/transformers/models/upernet/H_48_D_4_proto_coarse.json')
-        self.coarse_pixel_loss = PixelPrototypeCELoss(configer=configer)
+        self.coarse_pixel_loss = PixelPrototypeCELoss(ignore_index=255)
         self.coarse_pixel_loss = self.coarse_pixel_loss#.cuda(cuda_id)
 
-        configer = Configer(configs='/remote-home/chenhao/code/transformers/src/transformers/models/upernet/H_48_D_4_proto_fine.json')
-        self.fine_pixel_loss = PixelPrototypeCELoss(configer=configer)
+        self.fine_pixel_loss = PixelPrototypeCELoss(ignore_index=255)
         self.fine_pixel_loss = self.fine_pixel_loss#.cuda(cuda_id)
-
 
 
     def init_weights(self):
@@ -370,16 +384,16 @@ class UperNetHead(nn.Module):
         return losses
 
     def get_sup_loss(self, coarse_emb, fine_emb, coarse_lab, fine_lab):
-        # coarse_emb:    [bs, c, h, w]
-        # coarse_lab:    [bs, 1, h, w]
-        # fine_emb:  [bs, c, h, w]
-        # fine_lab:  [bs, 1, h, w]
+        # coarse_emb:    [b, c, h, w]
+        # coarse_lab:    [b, h, w]
+        # fine_emb:  [b, c, h, w]
+        # fine_lab:  [b, h, w]
 
-        total_losses = dict()
         # import pdb; pdb.set_trace()
+        total_losses = dict()
 
-        coarse_lab = coarse_lab.unsqueeze(1)
-        fine_lab = fine_lab.unsqueeze(1)
+        coarse_lab = coarse_lab.unsqueeze(1) #[b, 1, h, w]
+        fine_lab = fine_lab.unsqueeze(1) #[b, 1, h, w]
 
         # prototype-loss
         losses = self.get_coarse_pt_loss(coarse_emb, coarse_lab)
@@ -394,68 +408,67 @@ class UperNetHead(nn.Module):
 
         return total_losses
     
-    def get_fine2coarse_pt_loss(self, img_emb, img_labels):
+    def get_fine2coarse_pt_loss(self, img_emb, img_lab):
         '''
             img_emb: [bs, nc, h, w]
-            img_labels: [b, h, w], 15-class
+            img_lab: [b, h, w], 15-class
         '''
 
         b, nc, h, w = img_emb.shape
 
-        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
-        _c = self.feat_norm(_c)
-        _c = l2_normalize(_c)
+        emb = rearrange(img_emb, 'b c h w -> (b h w) c')
+        emb = self.feat_norm(emb)
+        emb = l2_normalize(emb)
 
         self.coarse_pt.data.copy_(l2_normalize(self.coarse_pt))
 
         # n: h*w, k: num_class, m: num_prototype
-        masks = torch.einsum('nd,kmd->nmk', _c, self.coarse_pt) #[bhw, m, k]
+        simi = torch.einsum('nd,kmd->nmk', emb, self.coarse_pt) #[bhw, m, k]
 
-        out_seg = torch.amax(masks, dim=1) #[bhw, k]
+        out_seg = torch.amax(simi, dim=1) #[bhw, k]
         out_seg = self.coarse_mask_norm(out_seg)
         out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
         
-        fine2coarse = torch.tensor([
-                0, 1,1, 2,2, 3,3,3, 4,4,4,4,4,4,4,4, 5,5,5,5,5,5, 6,6,6,6,6,6, 7,7,7,7, 8,8,8,8,8,8, 9,9,
-            ], 
-            dtype=img_labels.dtype, 
-            device=img_labels.device
+        fine2coarse = torch.tensor(
+            self.f2c_map, 
+            dtype=img_lab.dtype, 
+            device=img_lab.device
         )
-        fine2coarse_map = torch.ones(256, dtype=img_labels.dtype, device=img_labels.device) * 255
-        fine2coarse_map[:40] = fine2coarse
+        fine2coarse_map = torch.ones(256, dtype=img_lab.dtype, device=img_lab.device) * 255
+        fine2coarse_map[:len(fine2coarse)] = fine2coarse
 
-        img_labels = fine2coarse_map[img_labels] #[0,14] => [0,4] classes
-        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
-        contrast_logits, contrast_target = self._coarse_pt_learning(_c, out_seg, gt_seg, masks, update_prototype=False)
+        img_lab = fine2coarse_map[img_lab] #[0,14] => [0,4] classes
+        gt_seg = F.interpolate(img_lab.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._coarse_pt_learning(emb, out_seg, gt_seg, simi, update_prototype=False)
         outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
         
         self.coarse_pixel_loss.train()
-        loss = self.coarse_pixel_loss(outputs, img_labels.squeeze(1))
+        loss = self.coarse_pixel_loss(outputs, img_lab.squeeze(1))
         return {
-                'f2c_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
-                'f2c_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
-                'f2c_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+            'f2c_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+            'f2c_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+            'f2c_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
         }
 
-    def get_coarse2fine_pt_loss(self, img_emb, img_labels):
+    def get_coarse2fine_pt_loss(self, img_emb, img_lab):
         '''
             img_emb: [bs, nc, h, w]
-            img_labels: [bs, 1, h, w]
+            img_lab: [bs, 1, h, w]
         '''
         b, nc, h, w = img_emb.shape
 
-        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
-        _c = self.feat_norm(_c)
-        _c = l2_normalize(_c)
+        emb = rearrange(img_emb, 'b c h w -> (b h w) c')
+        emb = self.feat_norm(emb)
+        emb = l2_normalize(emb)
 
         self.fine_pt.data.copy_(l2_normalize(self.fine_pt))
 
         # n: h*w, k: num_class, m: num_prototype
-        masks = torch.einsum('nd,kmd->nmk', _c, self.fine_pt) #[bhw, m, k]
+        simi = torch.einsum('nd,kmd->nmk', emb, self.fine_pt) #[bhw, m, k]
 
         out_seg = list()
         for k in range(self.n_coarse_cls):
-            _seg = masks[..., self.c2f_map[k]] #[bhw, m, x]
+            _seg = simi[..., self.c2f_map[k]] #[bhw, m, x]
             _seg = rearrange(_seg, 'n m x -> n (m x)') #[bhw, mx]
             _seg = torch.amax(_seg, dim=1) #[bhw]
             out_seg.append(_seg)
@@ -463,96 +476,96 @@ class UperNetHead(nn.Module):
         out_seg = self.coarse_mask_norm(out_seg)
         out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
 
-        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
-        contrast_logits, contrast_target = self._coarse2fine_pt_learning(_c, out_seg, gt_seg, masks)
+        gt_seg = F.interpolate(img_lab.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._coarse2fine_pt_learning(emb, out_seg, gt_seg, simi)
         outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
         
         self.coarse_pixel_loss.train()
-        loss = self.coarse_pixel_loss(outputs, img_labels.squeeze(1))
+        loss = self.coarse_pixel_loss(outputs, img_lab.squeeze(1))
         return {
-                'c2f_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
-                'c2f_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
-                'c2f_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+            'c2f_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+            'c2f_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+            'c2f_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
         }
 
-    def get_fine_pt_loss(self, img_emb, img_labels):
+    def get_fine_pt_loss(self, img_emb, img_lab):
         '''
-            img_emb: [bs, nc, h, w]
-            img_labels: [bs, 1, h, w]
+            img_emb: [b, nc, h, w]
+            img_lab: [b, 1, h, w]
         '''
 
         b, nc, h, w = img_emb.shape
 
-        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
-        _c = self.feat_norm(_c)
-        _c = l2_normalize(_c)
+        emb = rearrange(img_emb, 'b c h w -> (b h w) c')
+        emb = self.feat_norm(emb)
+        emb = l2_normalize(emb)
 
-        self.fine_pt.data.copy_(l2_normalize(self.fine_pt))
+        self.fine_pt.data.copy_(l2_normalize(self.fine_pt)) 
 
         # n: h*w, k: num_class, m: num_prototype
-        masks = torch.einsum('nd,kmd->nmk', _c, self.fine_pt) #[bhw, m, k]
+        simi = torch.einsum('nd,kmd->nmk', emb, self.fine_pt) #[bhw, m, k]
 
-        out_seg = torch.amax(masks, dim=1) #[bhw, k]
+        out_seg = torch.amax(simi, dim=1) #[bhw, k]
         out_seg = self.fine_mask_norm(out_seg)
         out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
 
-        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
-        contrast_logits, contrast_target = self._fine_pt_learning(_c, out_seg, gt_seg, masks, update_prototype=True)
+        gt_seg = F.interpolate(img_lab.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._fine_pt_learning(emb, out_seg, gt_seg, simi, update_prototype=True)
         outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
+
+        import pdb; pdb.set_trace()
         
         self.fine_pixel_loss.train()
-        loss = self.fine_pixel_loss(outputs, img_labels.squeeze(1))
+        loss = self.fine_pixel_loss(outputs, img_lab.squeeze(1))
         return {
-                'fine_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
-                'fine_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
-                'fine_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+            'fine_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+            'fine_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+            'fine_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
         }
 
-    def get_coarse_pt_loss(self, img_emb, img_labels):
+    def get_coarse_pt_loss(self, img_emb, img_lab):
         '''
             img_emb: [bs, nc, h, w]
-            img_labels: [bs, 1, h, w]
+            img_lab: [bs, 1, h, w]
         '''
-
         b, nc, h, w = img_emb.shape
-        # seg = self.coarse_cls_head(c)
 
-        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
-        _c = self.feat_norm(_c)
-        _c = l2_normalize(_c)
+        emb = rearrange(img_emb, 'b c h w -> (b h w) c')
+        emb = self.feat_norm(emb)
+        emb = l2_normalize(emb)
 
         self.coarse_pt.data.copy_(l2_normalize(self.coarse_pt))
 
         # n: h*w, k: num_class, m: num_prototype
-        masks = torch.einsum('nd,kmd->nmk', _c, self.coarse_pt) #[bhw, m, k]
+        simi = torch.einsum('nd,kmd->nmk', emb, self.coarse_pt) #[bhw, m, k]
 
-        out_seg = torch.amax(masks, dim=1) #[bhw, k]
+        out_seg = torch.amax(simi, dim=1) #[bhw, k]
         out_seg = self.coarse_mask_norm(out_seg)
         out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
 
-        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
-        contrast_logits, contrast_target = self._coarse_pt_learning(_c, out_seg, gt_seg, masks, update_prototype=True)
+        gt_seg = F.interpolate(img_lab.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._coarse_pt_learning(emb, out_seg, gt_seg, simi, update_prototype=True)
         outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
         
         self.coarse_pixel_loss.train()
-        loss = self.coarse_pixel_loss(outputs, img_labels.squeeze(1))
+        loss = self.coarse_pixel_loss(outputs, img_lab.squeeze(1))
         return {
-                'coarse_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
-                'coarse_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
-                'coarse_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+            'coarse_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+            'coarse_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+            'coarse_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
         }
 
-    def _coarse_pt_learning(self, _c, out_seg, gt_seg, masks, update_prototype):
+    def _coarse_pt_learning(self, emb, out_seg, gt_seg, simi, update_prototype):
         '''
-            _c:      [bhw, c]
+            emb:      [bhw, c]
             out_seg: [b, k, h, w]
             gt_seg:  [bhw]
-            masks:   [bhw, m, k]
+            simi:   [bhw, m, k]
         '''
         pred_seg = torch.max(out_seg, 1)[1]
         mask = (gt_seg == pred_seg.view(-1))
 
-        cosine_similarity = torch.mm(_c, self.coarse_pt.view(-1, self.coarse_pt.shape[-1]).t())
+        cosine_similarity = torch.mm(emb, self.coarse_pt.view(-1, self.coarse_pt.shape[-1]).t())
 
         proto_logits = cosine_similarity
         proto_target = gt_seg.clone().float()
@@ -560,7 +573,7 @@ class UperNetHead(nn.Module):
         # clustering for each class
         protos = self.coarse_pt.data.clone()
         for k in range(self.n_coarse_cls):
-            init_q = masks[..., k]
+            init_q = simi[..., k]
             init_q = init_q[gt_seg == k, ...]
             if init_q.shape[0] == 0:
                 continue
@@ -568,7 +581,7 @@ class UperNetHead(nn.Module):
             q, indexs = distributed_sinkhorn(init_q)
 
             m_k = mask[gt_seg == k]
-            c_k = _c[gt_seg == k, ...]
+            c_k = emb[gt_seg == k, ...]
 
             m_k_tile = repeat(m_k, 'n -> n tile', tile=self.n_coarse_pt)
             m_q = q * m_k_tile  # n x self.num_prototype
@@ -600,24 +613,24 @@ class UperNetHead(nn.Module):
 
         return proto_logits, proto_target
 
-    def _fine_pt_learning(self, _c, out_seg, gt_seg, masks, update_prototype):
+    def _fine_pt_learning(self, emb, out_seg, gt_seg, simi, update_prototype):
         '''
-            _c:      [bhw, c]
+            emb:      [bhw, c]
             out_seg: [b, k, h, w]
             gt_seg:  [bhw]
-            masks:   [bhw, m, k]
+            simi:   [bhw, m, k]
         '''
         pred_seg = torch.max(out_seg, 1)[1]
         mask = (gt_seg == pred_seg.view(-1)) #[bhw]
 
-        cosine_similarity = torch.mm(_c, self.fine_pt.view(-1, self.fine_pt.shape[-1]).t())
+        cosine_similarity = torch.mm(emb, self.fine_pt.view(-1, self.fine_pt.shape[-1]).t())
         proto_logits = cosine_similarity #[bhw, mk]
         proto_target = gt_seg.clone().float()
 
         # clustering for each class
         protos = self.fine_pt.data.clone()
         for k in range(self.n_fine_cls):
-            init_q = masks[..., k] #[bhw, m]
+            init_q = simi[..., k] #[bhw, m]
             init_q = init_q[gt_seg == k, ...] #[n, m]
             if init_q.shape[0] == 0:
                 continue
@@ -625,7 +638,7 @@ class UperNetHead(nn.Module):
             q, indexs = distributed_sinkhorn(init_q) # q:[n, 10]
 
             m_k = mask[gt_seg == k]     #[n]: 0 or 1, false negative or true positive
-            c_k = _c[gt_seg == k, ...]  #[n, c]
+            c_k = emb[gt_seg == k, ...]  #[n, c]
 
             m_k_tile = repeat(m_k, 'n -> n tile', tile=self.n_fine_pt) #[n, 10]
             m_q = q * m_k_tile  # n x self.num_prototype (10)
@@ -657,20 +670,20 @@ class UperNetHead(nn.Module):
 
         return proto_logits, proto_target
     
-    def _coarse2fine_pt_learning(self, _c, out_seg, gt_seg, masks):
+    def _coarse2fine_pt_learning(self, emb, out_seg, gt_seg, simi):
         '''
-            _c:      [bhw, 128]
+            emb:      [bhw, 128]
             out_seg: [b, 15, h, w]
             gt_seg:  [bhw], 5-class
-            masks:   [bhw, m, k], k=15
+            simi:   [bhw, m, k], k=15
         '''
-        cosine_similarity = torch.mm(_c, self.fine_pt.view(-1, self.fine_pt.shape[-1]).t())
+        cosine_similarity = torch.mm(emb, self.fine_pt.view(-1, self.fine_pt.shape[-1]).t())
         proto_logits = cosine_similarity #[bhw, km]
         proto_target = gt_seg.clone().float()
 
         for k in range(self.n_coarse_cls): # 这里是关键  pt数量变了
 
-            init_q = masks[..., self.c2f_map[k]] #[bhw, m, x]
+            init_q = simi[..., self.c2f_map[k]] #[bhw, m, x]
             init_q = rearrange(init_q, 'n m x -> n (m x)') #[bhw, mx]
             init_q = init_q[gt_seg == k, ...] #[n, xm]
             if init_q.shape[0] == 0:
@@ -943,3 +956,151 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         features = outputs.feature_maps
 
         return features[stage_index]
+    
+
+
+class FSCELoss(nn.Module):
+    def __init__(self, ignore_label):
+        super(FSCELoss, self).__init__()
+
+        weight = None
+        reduction = 'mean'
+        ignore_index = ignore_label
+
+        self.ce_loss = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction=reduction)
+
+    def forward(self, inputs, *targets, weights=None, **kwargs):
+        loss = 0.0
+        if isinstance(inputs, tuple) or isinstance(inputs, list):
+            if weights is None:
+                weights = [1.0] * len(inputs)
+
+            for i in range(len(inputs)):
+                if len(targets) > 1:
+                    target = self._scale_target(targets[i], (inputs[i].size(2), inputs[i].size(3)))
+                    loss += weights[i] * self.ce_loss(inputs[i], target)
+                else:
+                    target = self._scale_target(targets[0], (inputs[i].size(2), inputs[i].size(3)))
+                    loss += weights[i] * self.ce_loss(inputs[i], target)
+
+        else:
+            target = self._scale_target(targets[0], (inputs.size(2), inputs.size(3)))
+            loss = self.ce_loss(inputs, target)
+
+        return loss
+
+    @staticmethod
+    def _scale_target(targets_, scaled_size):
+        targets = targets_.clone().unsqueeze(1).float()
+        targets = F.interpolate(targets, size=scaled_size, mode='nearest')
+        return targets.squeeze(1).long()
+
+
+class PPC(nn.Module):
+    def __init__(self, ignore_label):
+        super(PPC, self).__init__()
+
+        self.ignore_label = ignore_label
+
+    def forward(self, contrast_logits, contrast_target):
+        loss_ppc = F.cross_entropy(contrast_logits, contrast_target.long(), ignore_index=self.ignore_label)
+
+        return loss_ppc
+
+
+class PPD(nn.Module):
+    def __init__(self, ignore_label):
+        super(PPD, self).__init__()
+
+        self.ignore_label = ignore_label
+
+    def forward(self, contrast_logits, contrast_target):
+        contrast_logits = contrast_logits[contrast_target != self.ignore_label, :]
+        contrast_target = contrast_target[contrast_target != self.ignore_label]
+
+        logits = torch.gather(contrast_logits, 1, contrast_target[:, None].long())
+        loss_ppd = (1 - logits).pow(2).mean()
+
+        return loss_ppd
+
+
+class PixelPrototypeCELoss(nn.Module):
+    def __init__(self, ignore_index):
+        super(PixelPrototypeCELoss, self).__init__()
+
+        self.loss_ppc_weight = 0.01 # pixel-prototype contrastive learning
+        self.loss_ppd_weight = 0.001 # pixel-prototype distance optimization
+
+        self.seg_criterion = FSCELoss(ignore_index=ignore_index)
+        self.ppc_criterion = PPC(ignore_index=ignore_index)
+        self.ppd_criterion = PPD(ignore_index=ignore_index)
+
+    def forward(self, preds, target):
+        h, w = target.size(1), target.size(2)
+
+        if isinstance(preds, dict):
+            assert "seg" in preds
+            assert "logits" in preds
+            assert "target" in preds
+
+            seg = preds['seg']
+            contrast_logits = preds['logits']
+            contrast_target = preds['target']
+            loss_ppc = self.ppc_criterion(contrast_logits, contrast_target)
+            loss_ppd = self.ppd_criterion(contrast_logits, contrast_target)
+
+            pred = F.interpolate(input=seg, size=(h, w), mode='bilinear', align_corners=True)
+            loss = self.seg_criterion(pred, target)
+            return {
+                'loss_seg': loss,
+                'loss_ppc': self.loss_ppc_weight * loss_ppc,
+                'loss_ppd': self.loss_ppd_weight * loss_ppd,
+            }
+
+        seg = preds
+        pred = F.interpolate(input=seg, size=(h, w), mode='bilinear', align_corners=True)
+        loss = self.seg_criterion(pred, target)
+        return loss
+
+
+def distributed_sinkhorn(out, sinkhorn_iterations=3, epsilon=0.05):
+    Q = torch.exp(out / epsilon).t() # K x B
+    B = Q.shape[1] # (bhw): 像素个数
+    K = Q.shape[0] # num of subcenter
+
+    # make the matrix sums to 1
+    sum_Q = torch.sum(Q)
+    Q /= sum_Q
+
+    for _ in range(sinkhorn_iterations):
+        # normalize each row: total weight per prototype must be 1/K
+        sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+        Q /= sum_of_rows
+        Q /= K
+
+        # normalize each column: total weight per sample must be 1/B
+        Q /= torch.sum(Q, dim=0, keepdim=True)
+        Q /= B
+
+    Q *= B # the colomns must sum to 1 so that Q is an assignment
+    Q = Q.t()
+
+    indexs = torch.argmax(Q, dim=1)
+    # Q = torch.nn.functional.one_hot(indexs, num_classes=Q.shape[1]).float()
+    Q = F.gumbel_softmax(Q, tau=0.5, hard=True)
+
+    return Q, indexs
+
+
+def momentum_update(old_value, new_value, momentum, debug=False):
+    update = momentum * old_value + (1 - momentum) * new_value
+    if debug:
+        print("old prot: {:.3f} x |{:.3f}|, new val: {:.3f} x |{:.3f}|, result= |{:.3f}|".format(
+            momentum, torch.norm(old_value, p=2), (1 - momentum), torch.norm(new_value, p=2),
+            torch.norm(update, p=2)))
+    return update
+
+
+def l2_normalize(x):
+    return F.normalize(x, p=2, dim=-1)
+
