@@ -215,13 +215,13 @@ class UperNetHead(nn.Module):
             'Unknown': ['Unknown'],
             'Bareland': ['Unknown', '野外荒地', '城市荒地'],
             'Rangeland': ['Unknown', '野外草地', '城市草地'],
-            'Developed': ['Unknown', '乡村人工开阔地', '城市人工开阔地', '体育场'],
-            'Road': ['Unknown', '田间小径', '乡村小道', '城际大道', '市区道路', '铁路', '河流桥梁', '过街天桥', '城市高架路'],
-            'Tree': ['Unknown', '野外单棵树', '野外森林', '行道树', '城市园区树木', '城市单棵树', '城市公园树林'],
+            'Developed': ['Unknown', '乡村人工开阔地', '城市人工开阔地', '露天运动场'],
+            'Road': ['Unknown', '田埂', '乡村小道', '城际大道', '市区道路', '铁路', '水面桥梁', '过街天桥', '城市高架路'],
+            'Tree': ['Unknown', 'Economic Forest', '野外单棵树', '野外树林', '行道树', '城市单棵树', '城市小区树木', '城市公园树林'],
             'Water': ['Unknown', 'River', 'Lake', 'Pond', 'Fishpond', 'Swimming pool', '城市pond'],
             'Agriculture': ['Unknown', '旱田', '水田', '果园', 'Greenhouse'],
-            'Building': ['Unknown', '乡村独栋住宅', '城市低层建筑', '城市高层建筑', '车站大楼', '商场大楼', '其他公共建筑'],
-            'Others': ['Unknown', 'Shadow', 'Vehicle'],
+            'Building': ['Unknown', '乡村独栋建筑', '城市低层建筑', '城市高层建筑', '工业厂房', '车站建筑', '商区建筑', '其他公共建筑', 'Waterfront facility'],
+            'Others': ['Unknown', 'Shadow', 'Vehicle', 'Solar panel'],
         }
 
         self.c2f_map = list()
@@ -238,11 +238,11 @@ class UperNetHead(nn.Module):
                     fine_indices.append(fine_count)
                     fine_count += 1
             self.c2f_map.append(fine_indices)
-            self.f2c_map.append([coarse_count] * len(fine_indices))
+            self.f2c_map.extend([coarse_count] * len(fine_indices))
             coarse_count += 1
 
         # self.c2f_map = [[0, 1], [2, 3], [4, 5, 6], [7, 8, 9, 10, 11, 12, 13, 14], [15, 16, 17, 18, 19, 20], [21, 22, 23, 24, 25, 26], [27, 28, 29, 30], [31, 32, 33, 34, 35, 36], [37, 38]]
-        # self.f2c_map = [[0, 0], [1, 1], [2, 2, 2], [3, 3, 3, 3, 3, 3, 3, 3], [4, 4, 4, 4, 4, 4], [5, 5, 5, 5, 5, 5], [6, 6, 6, 6], [7, 7, 7, 7, 7, 7], [8, 8]]
+        # self.f2c_map = [0, 0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 8, 8]
 
 
         cuda_id = 1
@@ -416,6 +416,8 @@ class UperNetHead(nn.Module):
 
         b, nc, h, w = img_emb.shape
 
+        # import pdb; pdb.set_trace()
+
         emb = rearrange(img_emb, 'b c h w -> (b h w) c')
         emb = self.feat_norm(emb)
         emb = l2_normalize(emb)
@@ -513,7 +515,7 @@ class UperNetHead(nn.Module):
         contrast_logits, contrast_target = self._fine_pt_learning(emb, out_seg, gt_seg, simi, update_prototype=True)
         outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
 
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         
         self.fine_pixel_loss.train()
         loss = self.fine_pixel_loss(outputs, img_lab.squeeze(1))
@@ -960,12 +962,12 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
 
 
 class FSCELoss(nn.Module):
-    def __init__(self, ignore_label):
+    def __init__(self, ignore_index):
         super(FSCELoss, self).__init__()
 
         weight = None
         reduction = 'mean'
-        ignore_index = ignore_label
+        self.ignore_index = ignore_index
 
         self.ce_loss = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction=reduction)
 
@@ -997,26 +999,24 @@ class FSCELoss(nn.Module):
 
 
 class PPC(nn.Module):
-    def __init__(self, ignore_label):
+    def __init__(self, ignore_index):
         super(PPC, self).__init__()
-
-        self.ignore_label = ignore_label
+        self.ignore_index = ignore_index
 
     def forward(self, contrast_logits, contrast_target):
-        loss_ppc = F.cross_entropy(contrast_logits, contrast_target.long(), ignore_index=self.ignore_label)
-
+        loss_ppc = F.cross_entropy(contrast_logits, contrast_target.long(), ignore_index=self.ignore_index)
         return loss_ppc
 
 
 class PPD(nn.Module):
-    def __init__(self, ignore_label):
+    def __init__(self, ignore_index):
         super(PPD, self).__init__()
 
-        self.ignore_label = ignore_label
+        self.ignore_index = ignore_index
 
     def forward(self, contrast_logits, contrast_target):
-        contrast_logits = contrast_logits[contrast_target != self.ignore_label, :]
-        contrast_target = contrast_target[contrast_target != self.ignore_label]
+        contrast_logits = contrast_logits[contrast_target != self.ignore_index, :]
+        contrast_target = contrast_target[contrast_target != self.ignore_index]
 
         logits = torch.gather(contrast_logits, 1, contrast_target[:, None].long())
         loss_ppd = (1 - logits).pow(2).mean()
