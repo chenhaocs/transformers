@@ -211,19 +211,29 @@ class UperNetHead(nn.Module):
         ##############################################################################################
         # add prototype classifier head
         ##############################################################################################
-        c2f_classnames = {
-            'Unknown': ['Unknown'],
-            'Bareland': ['Unknown', '野外荒地', '城市荒地'],
-            'Rangeland': ['Unknown', '野外草地', '城市草地'],
-            'Developed': ['Unknown', '乡村人工开阔地', '城市人工开阔地', '露天运动场'],
-            'Road': ['Unknown', '田埂', '乡村小道', '城际大道', '市区道路', '铁路', '水面桥梁', '过街天桥', '城市高架路'],
-            'Tree': ['Unknown', 'Economic Forest', '野外单棵树', '野外树林', '行道树', '城市单棵树', '城市小区树木', '城市公园树林'],
-            'Water': ['Unknown', 'River', 'Lake', 'Pond', 'Fishpond', 'Swimming pool', '城市pond'],
-            'Agriculture': ['Unknown', '旱田', '水田', '果园', 'Greenhouse'],
-            'Building': ['Unknown', '乡村独栋建筑', '城市低层建筑', '城市高层建筑', '工业厂房', '车站建筑', '商区建筑', '其他公共建筑', 'Waterfront facility'],
-            'Others': ['Unknown', 'Shadow', 'Vehicle', 'Solar panel'],
-        }
+        # c2f_classnames = {
+        #     'Unknown': ['Unknown'],
+        #     'Bareland': ['Unknown', '野外荒地', '城市荒地'],
+        #     'Rangeland': ['Unknown', '野外草地', '城市草地'],
+        #     'Developed': ['Unknown', '乡村人工开阔地', '城市人工开阔地', '露天运动场'],
+        #     'Road': ['Unknown', '田埂', '乡村小道', '城际大道', '市区道路', '铁路', '水面桥梁', '过街天桥', '城市高架路'],
+        #     'Tree': ['Unknown', 'Economic Forest', '野外单棵树', '野外树林', '行道树', '城市单棵树', '城市小区树木', '城市公园树林'],
+        #     'Water': ['Unknown', 'River', 'Lake', 'Pond', 'Fishpond', 'Swimming pool', '城市pond'],
+        #     'Agriculture': ['Unknown', '旱田', '水田', '果园', 'Greenhouse'],
+        #     'Building': ['Unknown', '乡村独栋建筑', '城市低层建筑', '城市高层建筑', '工业厂房', '车站建筑', '商区建筑', '其他公共建筑', 'Waterfront facility'],
+        #     'Others': ['Unknown', 'Shadow', 'Vehicle', 'Solar panel'],
+        # }
 
+        import os,json
+        c2f_path = '/remote-home/chenhao/code/cod_c2f/subclass_unet/src_lulc/finetune/c2f_classnames.json'
+
+        def get_c2f_classnames(c2f_path):
+            assert os.path.exists(c2f_path)
+            with open(c2f_path) as fr:
+                c2f_classnames = json.load(fr)
+            return c2f_classnames
+
+        c2f_classnames = get_c2f_classnames(c2f_path)
         self.c2f_map = list()
         self.f2c_map = list()
 
@@ -243,7 +253,9 @@ class UperNetHead(nn.Module):
 
         # self.c2f_map = [[0, 1], [2, 3], [4, 5, 6], [7, 8, 9, 10, 11, 12, 13, 14], [15, 16, 17, 18, 19, 20], [21, 22, 23, 24, 25, 26], [27, 28, 29, 30], [31, 32, 33, 34, 35, 36], [37, 38]]
         # self.f2c_map = [0, 0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 8, 8]
-
+        print(c2f_classnames)
+        print(self.c2f_map)
+        print(self.f2c_map)
 
         cuda_id = 1
 
@@ -347,6 +359,32 @@ class UperNetHead(nn.Module):
 
         return output
     
+    def get_coarse_and_fine_logits(self, features):
+        img_emb = self._build_feat_emb(features)
+
+        b, nc, h, w = img_emb.shape
+
+        emb = rearrange(img_emb, 'b c h w -> (b h w) c')
+        emb = self.feat_norm(emb)
+        emb = l2_normalize(emb)
+
+        self.fine_pt.data.copy_(l2_normalize(self.fine_pt))
+        self.coarse_pt.data.copy_(l2_normalize(self.coarse_pt))
+
+        # n: h*w, k: num_class, m: num_prototype
+        f_simi = torch.einsum('nd,kmd->nmk', emb, self.fine_pt) #[bhw, m, k]
+        c_simi = torch.einsum('nd,kmd->nmk', emb, self.coarse_pt) #[bhw, m, k]
+
+        f_logits = torch.amax(f_simi, dim=1) #[bhw, k]
+        f_logits = self.fine_mask_norm(f_logits)
+        f_logits = rearrange(f_logits, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
+
+        c_logits = torch.amax(c_simi, dim=1) #[bhw, k]
+        c_logits = self.coarse_mask_norm(c_logits)
+        c_logits = rearrange(c_logits, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
+
+        return c_logits, f_logits
+
     def _build_feat_emb(self, features):
         # build laterals
         laterals = [lateral_conv(features[i]) for i, lateral_conv in enumerate(self.lateral_convs)]
@@ -959,6 +997,23 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
 
         return features[stage_index]
     
+    def get_logits(
+        self, 
+        pixel_values,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ):
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+
+        outputs = self.backbone.forward_with_filtered_kwargs(
+            pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+        )
+        features = outputs.feature_maps
+        c_logits, f_logits = self.decode_head.get_coarse_and_fine_logits(features)
+        return c_logits, f_logits
 
 
 class FSCELoss(nn.Module):
