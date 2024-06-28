@@ -211,19 +211,6 @@ class UperNetHead(nn.Module):
         ##############################################################################################
         # add prototype classifier head
         ##############################################################################################
-        # c2f_classnames = {
-        #     'Unknown': ['Unknown'],
-        #     'Bareland': ['Unknown', '野外荒地', '城市荒地'],
-        #     'Rangeland': ['Unknown', '野外草地', '城市草地'],
-        #     'Developed': ['Unknown', '乡村人工开阔地', '城市人工开阔地', '露天运动场'],
-        #     'Road': ['Unknown', '田埂', '乡村小道', '城际大道', '市区道路', '铁路', '水面桥梁', '过街天桥', '城市高架路'],
-        #     'Tree': ['Unknown', 'Economic Forest', '野外单棵树', '野外树林', '行道树', '城市单棵树', '城市小区树木', '城市公园树林'],
-        #     'Water': ['Unknown', 'River', 'Lake', 'Pond', 'Fishpond', 'Swimming pool', '城市pond'],
-        #     'Agriculture': ['Unknown', '旱田', '水田', '果园', 'Greenhouse'],
-        #     'Building': ['Unknown', '乡村独栋建筑', '城市低层建筑', '城市高层建筑', '工业厂房', '车站建筑', '商区建筑', '其他公共建筑', 'Waterfront facility'],
-        #     'Others': ['Unknown', 'Shadow', 'Vehicle', 'Solar panel'],
-        # }
-
         import os,json
         c2f_path = '/remote-home/chenhao/code/cod_c2f/subclass_unet/src_lulc/finetune/c2f_classnames.json'
 
@@ -240,7 +227,12 @@ class UperNetHead(nn.Module):
         fine_count = 0
         coarse_count = 0
         for cname,fnames in c2f_classnames.items():
-            if cname.lower() == 'unknown': continue
+            if cname.lower() == 'unknown':
+                self.c2f_map.append([0])
+                self.f2c_map.extend([0])
+                coarse_count += 1
+                fine_count += 1
+                continue
 
             fine_indices = list()
             for fname in fnames:
@@ -251,8 +243,8 @@ class UperNetHead(nn.Module):
             self.f2c_map.extend([coarse_count] * len(fine_indices))
             coarse_count += 1
 
-        # self.c2f_map = [[0, 1], [2, 3], [4, 5, 6], [7, 8, 9, 10, 11, 12, 13, 14], [15, 16, 17, 18, 19, 20], [21, 22, 23, 24, 25, 26], [27, 28, 29, 30], [31, 32, 33, 34, 35, 36], [37, 38]]
-        # self.f2c_map = [0, 0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 8, 8]
+        # c2f_map = [[0], [1, 2], [3, 4], [5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15], [16, 17, 18, 19, 20, 21, 22], [23, 24, 25, 26, 27, 28], [29, 30, 31, 32], [33, 34, 35, 36, 37, 38, 39, 40], [41, 42, 43]]
+        # f2c_map = [0, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9]
         print(c2f_classnames)
         print(self.c2f_map)
         print(self.f2c_map)
@@ -296,10 +288,10 @@ class UperNetHead(nn.Module):
         self.seg_loss_weight = 1.0
         # self.ps_loss_weight  = 1.0
 
-        self.coarse_pixel_loss = PixelPrototypeCELoss(ignore_index=255)
+        self.coarse_pixel_loss = PixelPrototypeCELoss(ignore_index=0)
         self.coarse_pixel_loss = self.coarse_pixel_loss#.cuda(cuda_id)
 
-        self.fine_pixel_loss = PixelPrototypeCELoss(ignore_index=255)
+        self.fine_pixel_loss = PixelPrototypeCELoss(ignore_index=0)
         self.fine_pixel_loss = self.fine_pixel_loss#.cuda(cuda_id)
 
 
