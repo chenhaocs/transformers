@@ -26,6 +26,9 @@ from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward
 from ...utils.backbone_utils import load_backbone
 from .configuration_upernet import UperNetConfig
 
+import numpy as np
+import cv2
+
 
 # General docstring
 _CONFIG_FOR_DOC = "UperNetConfig"
@@ -165,7 +168,6 @@ class UperNetHead(nn.Module):
         self.in_channels = in_channels
         self.channels = config.hidden_size
         self.align_corners = False
-        # self.classifier = nn.Conv2d(self.channels, config.num_labels, kernel_size=1)
 
         # PSP Module
         self.psp_modules = UperNetPyramidPoolingModule(
@@ -189,18 +191,20 @@ class UperNetHead(nn.Module):
             self.lateral_convs.append(l_conv)
             self.fpn_convs.append(fpn_conv)
 
-        # self.fpn_bottleneck = UperNetConvModule(
-        #     len(self.in_channels) * self.channels,
-        #     self.channels,
-        #     kernel_size=3,
-        #     padding=1,
-        # )
-        # self.upsamplerX2 = PixelShuffleUpsampler(2048) #chenhao
-        # self.upsamplerX4 = PixelShuffleUpsampler(2048 // 4)
-        # self.classifier = nn.Conv2d(2048 // 4**2, config.num_labels, kernel_size=1)
-
-        self.upsamplerX2 = PixelShuffleUpsampler(1024) #chenhao
-        self.classifier = nn.Conv2d(1024 // 4, config.num_labels, kernel_size=1)
+        self.fpn_bottleneck = UperNetConvModule(
+            1024,
+            512,
+            kernel_size=3,
+            padding=1,
+        )
+        self.upsamplerX2 = PixelShuffleUpsampler(512)
+        self.classifier1 = UperNetConvModule(
+            512 // 4,
+            512 // 4,
+            kernel_size=3,
+            padding=1,
+        )
+        self.classifier2 = nn.Conv2d(512 // 4, config.num_labels, kernel_size=1)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -245,20 +249,15 @@ class UperNetHead(nn.Module):
                 fpn_outs[i], size=fpn_outs[0].shape[2:], mode="bilinear", align_corners=self.align_corners
             )
         fpn_outs = torch.cat(fpn_outs, dim=1)  #[1, 2048, 128, 128]
-        #swin-tiny: [96, 192, 384, 768] 1440
+        #swin-tiny:  [96, 192, 384, 768] 1440
         #swin-small: [96, 192, 384, 768] 2048
 
-        # output = self.fpn_bottleneck(fpn_outs)
+        feat_map = self.fpn_bottleneck(fpn_outs)    #[1, 512, 256, 256]
+        feat_map = self.upsamplerX2(feat_map)       #[1, 128, 512, 512]
+        logits = self.classifier1(feat_map)         #[1, 128, 512, 512]
+        logits = self.classifier2(logits)           #[1, 9, 512, 512]
 
-        # import pdb; pdb.set_trace()
-        # output = self.upsamplerX2(fpn_outs)    #[1, 512, 256, 256]
-        # output = self.upsamplerX4(output)      #[1, 128, 512, 512]
-        # output = self.classifier(output)       #[1, 9, 512, 512]
-
-        output = self.upsamplerX2(fpn_outs)    #[1, 512, 512, 512]
-        output = self.classifier(output)       #[1, 9, 512, 512]
-
-        return output
+        return logits, feat_map
 
 
 class UperNetFCNHead(nn.Module):
@@ -400,9 +399,176 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.loss_t1 = nn.CrossEntropyLoss()
+        self.loss_t2 = nn.CrossEntropyLoss()
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
     @add_start_docstrings_to_model_forward(UPERNET_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=SemanticSegmenterOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
+        self,
+        lab_img,
+        lab_ann,
+        tile1,
+        tile2,
+        tile1_msk,
+        overlap_wh,
+        overlap_upleft_xy_in_t1,
+        overlap_upleft_xy_in_t2,
+        # pixel_values: Optional[torch.Tensor] = None,
+        # labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[tuple, SemanticSegmenterOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, height, width)`, *optional*):
+            Ground truth semantic segmentation maps for computing the loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels > 1`, a classification loss is computed (Cross-Entropy).
+
+        Returns:
+
+        Examples:
+        ```python
+        >>> from transformers import AutoImageProcessor, UperNetForSemanticSegmentation
+        >>> from PIL import Image
+        >>> from huggingface_hub import hf_hub_download
+
+        >>> image_processor = AutoImageProcessor.from_pretrained("openmmlab/upernet-convnext-tiny")
+        >>> model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-convnext-tiny")
+
+        >>> filepath = hf_hub_download(
+        ...     repo_id="hf-internal-testing/fixtures_ade20k", filename="ADE_val_00000001.jpg", repo_type="dataset"
+        ... )
+        >>> image = Image.open(filepath).convert("RGB")
+
+        >>> inputs = image_processor(images=image, return_tensors="pt")
+
+        >>> outputs = model(**inputs)
+
+        >>> logits = outputs.logits  # shape (batch_size, num_labels, height, width)
+        >>> list(logits.shape)
+        [1, 150, 512, 512]
+        ```"""
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+
+        outputs = self.backbone.forward_with_filtered_kwargs(
+            lab_img, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+        )
+        features = outputs.feature_maps
+        logits, _ = self.decode_head(features) #feat_map: [b, 128, 512, 512]
+
+        auxiliary_logits = None
+        if self.auxiliary_head is not None:
+            auxiliary_logits = self.auxiliary_head(features)
+            auxiliary_logits = nn.functional.interpolate(
+                auxiliary_logits, size=lab_img.shape[2:], mode="bilinear", align_corners=False
+            )
+
+        loss = None
+        if lab_ann is not None:
+            if self.config.num_labels == 1:
+                raise ValueError("The number of labels should be greater than one")
+            else:
+                # compute weighted loss
+                loss_fct = CrossEntropyLoss(ignore_index=self.config.loss_ignore_index)
+                loss = loss_fct(logits, lab_ann)
+                if auxiliary_logits is not None:
+                    auxiliary_loss = loss_fct(auxiliary_logits, lab_ann)
+                    loss += self.config.auxiliary_loss_weight * auxiliary_loss
+
+
+        # import pdb; pdb.set_trace()
+
+        # ================================================================================
+        # unsupervised learning
+        # ================================================================================
+        outputs = self.backbone.forward_with_filtered_kwargs(
+            tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+        )
+        features = outputs.feature_maps
+        _, t1_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
+
+        outputs = self.backbone.forward_with_filtered_kwargs(
+            tile2, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+        )
+        features = outputs.feature_maps
+        _, t2_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
+
+        batch_size = tile1.shape[0]
+        tensor_device = tile1.device
+        # kernel = np.ones((3, 3), np.uint8)
+
+        b_loss_sum = 0
+        for b in range(batch_size):
+
+            w, h = overlap_wh[b].to(torch.int32)
+            x, y = overlap_upleft_xy_in_t1[b].to(torch.int32)
+            t1 = t1_fm[b, :, y:y+h, x:x+w] # [128, h, w]
+
+            overlap_msk = tile1_msk[b, y:y+h, x:x+w] # [h, w]
+
+            x, y = overlap_upleft_xy_in_t2[b].to(torch.int32)
+            t2 = t2_fm[b, :, y:y+h, x:x+w] # [128, h, w]
+
+            assert t1.shape[1:] == t2.shape[1:]
+
+            t1 = t1.permute(1, 2, 0) # [h, w, 128]
+            t2 = t2.permute(1, 2, 0) # [h, w, 128]
+
+            t1_fvs = list() # feature vectors (fvs)
+            t2_fvs = list()
+
+            obj_ids = overlap_msk.unique()
+            for id in obj_ids:
+                if id == 0: continue
+
+                # roi = (overlap_msk[b] == id).detach().cpu().numpy()
+                # eroded_roi = cv2.erode(roi.astype(np.uint8), kernel, iterations=1)
+                # eroded_roi = (eroded_roi > 0)
+                # if eroded_roi.sum() < 30: continue
+                # roi = torch.tensor(eroded_roi, device=tensor_device)
+
+                roi = (overlap_msk == id)
+                
+                t1_fvs.append(t1[roi].mean(dim=0)) #[128]
+                t2_fvs.append(t2[roi].mean(dim=0))
+
+            # import pdb; pdb.set_trace()
+
+            t1_fvs = torch.stack(t1_fvs, dim=0) #[n, 128]
+            t2_fvs = torch.stack(t2_fvs, dim=0)
+
+            # normalized features
+            t1_fvs = t1_fvs / t1_fvs.norm(dim=1, keepdim=True) #[n, 128]
+            t2_fvs = t2_fvs / t2_fvs.norm(dim=1, keepdim=True)
+
+            # cosine similarity as logits
+            logit_scale = self.logit_scale.exp()
+            logits_per_t1 = logit_scale * t1_fvs @ t2_fvs.t() #[n, n]
+            logits_per_t2 = logits_per_t1.t()
+
+            b_labels = torch.arange(t1_fvs.shape[0], dtype=torch.long, device=tensor_device)
+            b_loss = (self.loss_t1(logits_per_t1, b_labels) + self.loss_t2(logits_per_t2, b_labels))/2
+
+            loss += b_loss
+            # b_loss_sum += b_loss
+
+        return SemanticSegmenterOutput(
+            loss=loss,
+            # loss=b_loss_sum,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+    
+
+    def inference(
         self,
         pixel_values: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
@@ -451,9 +617,7 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         )
         features = outputs.feature_maps
 
-        logits = self.decode_head(features)
-        # logits = nn.functional.interpolate(logits, size=pixel_values.shape[2:], mode="bilinear", align_corners=False)
-        #chenhao
+        logits, _ = self.decode_head(features)
 
         auxiliary_logits = None
         if self.auxiliary_head is not None:
@@ -487,8 +651,26 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_feature_map_highlevel(
+        self,
+        pixel_values,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ):
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+
+        outputs = self.backbone.forward_with_filtered_kwargs(
+            pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+        )
+        features = outputs.feature_maps
+        _, feat_map = self.decode_head(features)
+        return feat_map
     
-    def get_feature_map(
+    def get_feature_map_lowlevel(
         self,
         pixel_values,
         stage_index,
@@ -504,5 +686,4 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
             pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
         )
         features = outputs.feature_maps
-
         return features[stage_index]
