@@ -28,6 +28,8 @@ from .configuration_upernet import UperNetConfig
 
 import numpy as np
 import cv2
+from einops import rearrange
+import torch.nn.functional as F
 
 
 # General docstring
@@ -124,20 +126,6 @@ class UperNetPyramidPoolingModule(nn.Module):
         return ppm_outs
 
 
-
-# class Upsample(nn.Module):
-#     def __init__(self, num_features) -> None:
-#         super().__init__()
-
-#         self.convolution = nn.Conv2d(num_features, num_features, 3, 1, 1)
-#         self.pixelshuffle = nn.PixelShuffle(2)
-    
-#     def forward(self, hidden_state):
-#         hidden_state = self.convolution(hidden_state)
-#         hidden_state = self.pixelshuffle(hidden_state)
-#         return hidden_state
-
-
 class PixelShuffleUpsampler(nn.Module):
     def __init__(self, num_features):
         super().__init__()
@@ -200,11 +188,11 @@ class UperNetHead(nn.Module):
         self.upsamplerX2 = PixelShuffleUpsampler(512)
         self.classifier1 = UperNetConvModule(
             512 // 4,
-            512 // 4,
+            512 // 8,
             kernel_size=3,
             padding=1,
         )
-        self.classifier2 = nn.Conv2d(512 // 4, config.num_labels, kernel_size=1)
+        self.classifier2 = nn.Conv2d(512 // 8, config.num_labels, kernel_size=1)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -225,8 +213,6 @@ class UperNetHead(nn.Module):
         return output
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        # import pdb; pdb.set_trace()
-
         # build laterals
         laterals = [lateral_conv(encoder_hidden_states[i]) for i, lateral_conv in enumerate(self.lateral_convs)]
         laterals.append(self.psp_forward(encoder_hidden_states))
@@ -403,6 +389,8 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         self.loss_t2 = nn.CrossEntropyLoss()
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+        self.consistent_or_neighbor_contrastive = True
+
     @add_start_docstrings_to_model_forward(UPERNET_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=SemanticSegmenterOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -415,6 +403,11 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         overlap_wh,
         overlap_upleft_xy_in_t1,
         overlap_upleft_xy_in_t2,
+        neigh_imgs,
+        neigh_msks,
+        tileid_objid,
+        anchor_pos_neg_rowid,
+        pos_neg_weight,
         # pixel_values: Optional[torch.Tensor] = None,
         # labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
@@ -486,172 +479,170 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         # import pdb; pdb.set_trace()
 
         # ================================================================================
-        # unsupervised learning
+        # Unsupervised learning via two-consistency
         # ================================================================================
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        _, t1_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
+        if self.consistent_or_neighbor_contrastive:
+            outputs = self.backbone.forward_with_filtered_kwargs(
+                tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+            )
+            features = outputs.feature_maps
+            _, t1_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
 
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            tile2, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        _, t2_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
+            outputs = self.backbone.forward_with_filtered_kwargs(
+                tile2, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+            )
+            features = outputs.feature_maps
+            _, t2_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
 
-        batch_size = tile1.shape[0]
-        tensor_device = tile1.device
-        # kernel = np.ones((3, 3), np.uint8)
+            batch_size = tile1.shape[0]
+            tensor_device = tile1.device
+            # kernel = np.ones((3, 3), np.uint8)
 
-        b_loss_sum = 0
-        for b in range(batch_size):
+            for b in range(batch_size):
 
-            w, h = overlap_wh[b].to(torch.int32)
-            x, y = overlap_upleft_xy_in_t1[b].to(torch.int32)
-            t1 = t1_fm[b, :, y:y+h, x:x+w] # [128, h, w]
+                w, h = overlap_wh[b].to(torch.int32)
+                x, y = overlap_upleft_xy_in_t1[b].to(torch.int32)
+                t1 = t1_fm[b, :, y:y+h, x:x+w] # [128, h, w]
 
-            overlap_msk = tile1_msk[b, y:y+h, x:x+w] # [h, w]
+                overlap_msk = tile1_msk[b, y:y+h, x:x+w] # [h, w]
 
-            x, y = overlap_upleft_xy_in_t2[b].to(torch.int32)
-            t2 = t2_fm[b, :, y:y+h, x:x+w] # [128, h, w]
+                x, y = overlap_upleft_xy_in_t2[b].to(torch.int32)
+                t2 = t2_fm[b, :, y:y+h, x:x+w] # [128, h, w]
 
-            assert t1.shape[1:] == t2.shape[1:]
+                assert t1.shape[1:] == t2.shape[1:]
 
-            t1 = t1.permute(1, 2, 0) # [h, w, 128]
-            t2 = t2.permute(1, 2, 0) # [h, w, 128]
+                t1 = t1.permute(1, 2, 0) # [h, w, 128]
+                t2 = t2.permute(1, 2, 0) # [h, w, 128]
 
-            t1_fvs = list() # feature vectors (fvs)
-            t2_fvs = list()
+                t1_fvs = list() # feature vectors (fvs)
+                t2_fvs = list()
 
-            obj_ids = overlap_msk.unique()
-            for id in obj_ids:
-                if id == 0: continue
+                obj_ids = overlap_msk.unique()
+                for id in obj_ids:
+                    if id == 0: continue
 
-                # roi = (overlap_msk[b] == id).detach().cpu().numpy()
-                # eroded_roi = cv2.erode(roi.astype(np.uint8), kernel, iterations=1)
-                # eroded_roi = (eroded_roi > 0)
-                # if eroded_roi.sum() < 30: continue
-                # roi = torch.tensor(eroded_roi, device=tensor_device)
+                    # roi = (overlap_msk[b] == id).detach().cpu().numpy()
+                    # eroded_roi = cv2.erode(roi.astype(np.uint8), kernel, iterations=1)
+                    # eroded_roi = (eroded_roi > 0)
+                    # if eroded_roi.sum() < 30: continue
+                    # roi = torch.tensor(eroded_roi, device=tensor_device)
 
-                roi = (overlap_msk == id)
-                
-                t1_fvs.append(t1[roi].mean(dim=0)) #[128]
-                t2_fvs.append(t2[roi].mean(dim=0))
+                    roi = (overlap_msk == id)
+                    
+                    t1_fvs.append(t1[roi].mean(dim=0)) #[128]
+                    t2_fvs.append(t2[roi].mean(dim=0))
 
-            # import pdb; pdb.set_trace()
+                # import pdb; pdb.set_trace()
 
-            t1_fvs = torch.stack(t1_fvs, dim=0) #[n, 128]
-            t2_fvs = torch.stack(t2_fvs, dim=0)
+                t1_fvs = torch.stack(t1_fvs, dim=0) #[n, 128]
+                t2_fvs = torch.stack(t2_fvs, dim=0)
 
-            # normalized features
-            t1_fvs = t1_fvs / t1_fvs.norm(dim=1, keepdim=True) #[n, 128]
-            t2_fvs = t2_fvs / t2_fvs.norm(dim=1, keepdim=True)
+                # normalized features
+                t1_fvs = t1_fvs / t1_fvs.norm(dim=1, keepdim=True) #[n, 128]
+                t2_fvs = t2_fvs / t2_fvs.norm(dim=1, keepdim=True)
 
-            # cosine similarity as logits
-            logit_scale = self.logit_scale.exp()
-            logits_per_t1 = logit_scale * t1_fvs @ t2_fvs.t() #[n, n]
-            logits_per_t2 = logits_per_t1.t()
+                # cosine similarity as logits
+                logit_scale = self.logit_scale.exp()
+                logits_per_t1 = logit_scale * t1_fvs @ t2_fvs.t() #[n, n]
+                logits_per_t2 = logits_per_t1.t()
 
-            b_labels = torch.arange(t1_fvs.shape[0], dtype=torch.long, device=tensor_device)
-            b_loss = (self.loss_t1(logits_per_t1, b_labels) + self.loss_t2(logits_per_t2, b_labels))/2
+                b_labels = torch.arange(t1_fvs.shape[0], dtype=torch.long, device=tensor_device)
+                b_loss = (self.loss_t1(logits_per_t1, b_labels) + self.loss_t2(logits_per_t2, b_labels))/2
 
-            loss += b_loss
-            # b_loss_sum += b_loss
+                loss += b_loss
+            
+            self.consistent_or_neighbor_contrastive = False
+        
+        # ================================================================================
+        # Unsupervised learning via neighbor contrastive learning
+        # ================================================================================
+        else:
+            neigh_feat_maps = list()
+            neigh_imgs = rearrange(neigh_imgs, 'b n c h w->n b c h w') #[b, 9, 3, 256, 256] --> [9, b, 3, 256, 256]
+            for neigh_img in neigh_imgs:
+                outputs = self.backbone.forward_with_filtered_kwargs(
+                    neigh_img, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+                )
+                _, fm = self.decode_head(outputs.feature_maps) #feat_map (fm): [b, 128, 256, 256]
+                neigh_feat_maps.append(fm)
+
+            neigh_feat_maps = torch.stack(neigh_feat_maps, dim=0) #[9, b, 128, 256, 256]
+            neigh_feat_maps = rearrange(neigh_feat_maps, 'n b c h w->b n h w c') #[b, 9, 256, 256, 128]
+
+            for i in range(neigh_feat_maps.shape[0]): # Loop in batch-size
+                one_neigh_fm = neigh_feat_maps[i] #[9, 256, 256, 128]
+                one_neigh_msks = neigh_msks[i] #neigh_msks: [b, 9, h, w] --> [9, h, w]
+                one_tileid_objid = tileid_objid[i] #[n, 2]
+                one_apn_rowid = anchor_pos_neg_rowid[i] #[m, 21]
+                one_pnw = pos_neg_weight[i] #[m, 20]
+            
+                # import pdb; pdb.set_trace()
+
+                obj_fvs = list()
+                for j in range(one_tileid_objid.shape[0]): # Loop in object-list
+                    tileid, objid = one_tileid_objid[j]
+                    if tileid == -1: break
+
+                    roi = (one_neigh_msks[tileid] == objid) #[h, w]
+                    assert roi.sum() >= 10
+
+                    fv = one_neigh_fm[tileid][roi].mean(dim=0) #[128]
+                    obj_fvs.append(fv)
+                obj_fvs = torch.stack(obj_fvs, dim=0) #[n, 128]
+
+                pos_indices = np.random.choice(np.arange(1, 11), size=one_apn_rowid.shape[0], replace=True)
+                pos_rowids = one_apn_rowid[np.arange(one_apn_rowid.shape[0]), pos_indices]
+                pos_fvs = obj_fvs[pos_rowids] #[m, 128]
+                pos_weight = one_pnw[np.arange(one_pnw.shape[0]), (pos_indices-1)] #[m], one_pnw只有20列
+
+                neg_rowids = one_apn_rowid[:, 11:21] #[m, 10]
+                neg_fvs = obj_fvs[neg_rowids]        #[m, 10, 128]
+                neg_weight = one_pnw[:, 10:20]       #[m, 10]
+
+                anchor_rowids = one_apn_rowid[:, 0]  #[m]
+                anchor_fvs = obj_fvs[anchor_rowids]  #[m, 128]
+
+                loss += self.calc_weighted_infoNCE_loss(anchor_fvs, pos_fvs, neg_fvs, pos_weight, neg_weight)
+            
+            self.consistent_or_neighbor_contrastive = True
 
         return SemanticSegmenterOutput(
             loss=loss,
-            # loss=b_loss_sum,
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
     
+    def calc_infoNCE_loss(self, anchor_fvs, pos_fvs, neg_fvs):
+        # anchor_fvs: [m, 128], pos_fvs: [m, 128], neg_fvs: [m, 10, 128]
 
-    def inference(
-        self,
-        pixel_values: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        labels: Optional[torch.Tensor] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[tuple, SemanticSegmenterOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, height, width)`, *optional*):
-            Ground truth semantic segmentation maps for computing the loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels > 1`, a classification loss is computed (Cross-Entropy).
+        anchor_pos_sim = torch.bmm(anchor_fvs.unsqueeze(1), pos_fvs.unsqueeze(2)).squeeze()  # [m, 1]
+        anchor_neg_sim = torch.bmm(anchor_fvs.unsqueeze(1), neg_fvs.permute(0, 2, 1))  # [m, 10]
 
-        Returns:
+        # anchor_pos_sim: [m, 1] + anchor_neg_sim: [m, 10] --> [m, 11]
+        logits = torch.cat([anchor_pos_sim, anchor_neg_sim], dim=1)  # [m, 11]
 
-        Examples:
-        ```python
-        >>> from transformers import AutoImageProcessor, UperNetForSemanticSegmentation
-        >>> from PIL import Image
-        >>> from huggingface_hub import hf_hub_download
+        # 这里我们需要创建标签：正样本为0（索引），负样本为其余的索引
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
+        info_nce_loss = F.cross_entropy(logits, labels)
+        return info_nce_loss
+    
+    def calc_weighted_infoNCE_loss(self, anchor_fvs, pos_fvs, neg_fvs, pos_weight, neg_weight):
+        # anchor_fvs: [m, 128], pos_fvs: [m, 128], neg_fvs: [m, 10, 128], pos_weight: [m], neg_weight: [m, 10]
+        anchor_pos_sim = torch.bmm(anchor_fvs.unsqueeze(1), pos_fvs.unsqueeze(2)).squeeze(1)  # [m, 1]
+        anchor_neg_sim = torch.bmm(anchor_fvs.unsqueeze(1), neg_fvs.permute(0, 2, 1)).squeeze(1)  # [m, 10]
+        
+        weighted_anchor_pos_sim = anchor_pos_sim * pos_weight.unsqueeze(1)  # [m, 1]
+        weighted_anchor_neg_sim = anchor_neg_sim * neg_weight               # [m, 10]
 
-        >>> image_processor = AutoImageProcessor.from_pretrained("openmmlab/upernet-convnext-tiny")
-        >>> model = UperNetForSemanticSegmentation.from_pretrained("openmmlab/upernet-convnext-tiny")
+        # anchor_pos_sim: [m, 1] + anchor_neg_sim: [m, 10] --> [m, 11]
+        logits = torch.cat([weighted_anchor_pos_sim, weighted_anchor_neg_sim], dim=1)  # [m, 11]
 
-        >>> filepath = hf_hub_download(
-        ...     repo_id="hf-internal-testing/fixtures_ade20k", filename="ADE_val_00000001.jpg", repo_type="dataset"
-        ... )
-        >>> image = Image.open(filepath).convert("RGB")
-
-        >>> inputs = image_processor(images=image, return_tensors="pt")
-
-        >>> outputs = model(**inputs)
-
-        >>> logits = outputs.logits  # shape (batch_size, num_labels, height, width)
-        >>> list(logits.shape)
-        [1, 150, 512, 512]
-        ```"""
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-
-        logits, _ = self.decode_head(features)
-
-        auxiliary_logits = None
-        if self.auxiliary_head is not None:
-            auxiliary_logits = self.auxiliary_head(features)
-            auxiliary_logits = nn.functional.interpolate(
-                auxiliary_logits, size=pixel_values.shape[2:], mode="bilinear", align_corners=False
-            )
-
-        loss = None
-        if labels is not None:
-            if self.config.num_labels == 1:
-                raise ValueError("The number of labels should be greater than one")
-            else:
-                # compute weighted loss
-                loss_fct = CrossEntropyLoss(ignore_index=self.config.loss_ignore_index)
-                loss = loss_fct(logits, labels)
-                if auxiliary_logits is not None:
-                    auxiliary_loss = loss_fct(auxiliary_logits, labels)
-                    loss += self.config.auxiliary_loss_weight * auxiliary_loss
-
-        if not return_dict:
-            if output_hidden_states:
-                output = (logits,) + outputs[1:]
-            else:
-                output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SemanticSegmenterOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
+        # 创建标签：正样本为0（索引），负样本为其余的索引
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
+        info_nce_loss = F.cross_entropy(logits, labels)
+        return info_nce_loss
+    
     def get_feature_map_highlevel(
         self,
         pixel_values,
