@@ -389,7 +389,7 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         self.loss_t2 = nn.CrossEntropyLoss()
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        self.consistent_or_neighbor_contrastive = True
+        self.consistent_not_neighbor_contrastive = True
 
     @add_start_docstrings_to_model_forward(UPERNET_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=SemanticSegmenterOutput, config_class=_CONFIG_FOR_DOC)
@@ -481,7 +481,7 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         # ================================================================================
         # Unsupervised learning via two-consistency
         # ================================================================================
-        if self.consistent_or_neighbor_contrastive:
+        if self.consistent_not_neighbor_contrastive:
             outputs = self.backbone.forward_with_filtered_kwargs(
                 tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
             )
@@ -551,7 +551,7 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
 
                 loss += b_loss
             
-            self.consistent_or_neighbor_contrastive = False
+            self.consistent_not_neighbor_contrastive = False
         
         # ================================================================================
         # Unsupervised learning via neighbor contrastive learning
@@ -604,7 +604,7 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
 
                 loss += self.calc_weighted_infoNCE_loss(anchor_fvs, pos_fvs, neg_fvs, pos_weight, neg_weight)
             
-            self.consistent_or_neighbor_contrastive = True
+            self.consistent_not_neighbor_contrastive = True
 
         return SemanticSegmenterOutput(
             loss=loss,
