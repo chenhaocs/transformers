@@ -200,11 +200,11 @@ class UperNetHead(nn.Module):
         self.upsamplerX2 = PixelShuffleUpsampler(512)
         self.classifier1 = UperNetConvModule(
             512 // 4,
-            512 // 4,
+            512 // 8,
             kernel_size=3,
             padding=1,
         )
-        self.classifier2 = nn.Conv2d(512 // 4, config.num_labels, kernel_size=1)
+        self.classifier2 = nn.Conv2d(512 // 8, config.num_labels, kernel_size=1)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -225,8 +225,6 @@ class UperNetHead(nn.Module):
         return output
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        # import pdb; pdb.set_trace()
-
         # build laterals
         laterals = [lateral_conv(encoder_hidden_states[i]) for i, lateral_conv in enumerate(self.lateral_convs)]
         laterals.append(self.psp_forward(encoder_hidden_states))
@@ -483,10 +481,8 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
                     loss += self.config.auxiliary_loss_weight * auxiliary_loss
 
 
-        # import pdb; pdb.set_trace()
-
         # ================================================================================
-        # unsupervised learning
+        # Unsupervised learning
         # ================================================================================
         outputs = self.backbone.forward_with_filtered_kwargs(
             tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
@@ -502,9 +498,7 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
 
         batch_size = tile1.shape[0]
         tensor_device = tile1.device
-        # kernel = np.ones((3, 3), np.uint8)
 
-        b_loss_sum = 0
         for b in range(batch_size):
 
             w, h = overlap_wh[b].to(torch.int32)
@@ -528,18 +522,9 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
             for id in obj_ids:
                 if id == 0: continue
 
-                # roi = (overlap_msk[b] == id).detach().cpu().numpy()
-                # eroded_roi = cv2.erode(roi.astype(np.uint8), kernel, iterations=1)
-                # eroded_roi = (eroded_roi > 0)
-                # if eroded_roi.sum() < 30: continue
-                # roi = torch.tensor(eroded_roi, device=tensor_device)
-
                 roi = (overlap_msk == id)
-                
                 t1_fvs.append(t1[roi].mean(dim=0)) #[128]
                 t2_fvs.append(t2[roi].mean(dim=0))
-
-            # import pdb; pdb.set_trace()
 
             t1_fvs = torch.stack(t1_fvs, dim=0) #[n, 128]
             t2_fvs = torch.stack(t2_fvs, dim=0)
@@ -555,13 +540,10 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
 
             b_labels = torch.arange(t1_fvs.shape[0], dtype=torch.long, device=tensor_device)
             b_loss = (self.loss_t1(logits_per_t1, b_labels) + self.loss_t2(logits_per_t2, b_labels))/2
-
             loss += b_loss
-            # b_loss_sum += b_loss
 
         return SemanticSegmenterOutput(
             loss=loss,
-            # loss=b_loss_sum,
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
