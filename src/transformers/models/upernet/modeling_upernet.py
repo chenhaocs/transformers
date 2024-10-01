@@ -189,18 +189,20 @@ class UperNetHead(nn.Module):
             self.lateral_convs.append(l_conv)
             self.fpn_convs.append(fpn_conv)
 
-        # self.fpn_bottleneck = UperNetConvModule(
-        #     len(self.in_channels) * self.channels,
-        #     self.channels,
-        #     kernel_size=3,
-        #     padding=1,
-        # )
-        # self.upsamplerX2 = PixelShuffleUpsampler(2048) #chenhao
-        # self.upsamplerX4 = PixelShuffleUpsampler(2048 // 4)
-        # self.classifier = nn.Conv2d(2048 // 4**2, config.num_labels, kernel_size=1)
-
-        self.upsamplerX2 = PixelShuffleUpsampler(1024) #chenhao
-        self.classifier = nn.Conv2d(1024 // 4, config.num_labels, kernel_size=1)
+        self.fpn_bottleneck = UperNetConvModule(
+            1024,
+            512,
+            kernel_size=3,
+            padding=1,
+        )
+        self.upsamplerX2 = PixelShuffleUpsampler(512)
+        self.classifier1 = UperNetConvModule(
+            512 // 4,
+            512 // 8,
+            kernel_size=3,
+            padding=1,
+        )
+        self.classifier2 = nn.Conv2d(512 // 8, config.num_labels, kernel_size=1)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -221,8 +223,6 @@ class UperNetHead(nn.Module):
         return output
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        # import pdb; pdb.set_trace()
-
         # build laterals
         laterals = [lateral_conv(encoder_hidden_states[i]) for i, lateral_conv in enumerate(self.lateral_convs)]
         laterals.append(self.psp_forward(encoder_hidden_states))
@@ -248,17 +248,12 @@ class UperNetHead(nn.Module):
         #swin-tiny: [96, 192, 384, 768] 1440
         #swin-small: [96, 192, 384, 768] 2048
 
-        # output = self.fpn_bottleneck(fpn_outs)
+        feat_map = self.fpn_bottleneck(fpn_outs)    #[1, 512, 256, 256]
+        feat_map = self.upsamplerX2(feat_map)       #[1, 128, 512, 512]
+        logits = self.classifier1(feat_map)         #[1, 64, 512, 512]
+        logits = self.classifier2(logits)           #[1, 9, 512, 512]
 
-        # import pdb; pdb.set_trace()
-        # output = self.upsamplerX2(fpn_outs)    #[1, 512, 256, 256]
-        # output = self.upsamplerX4(output)      #[1, 128, 512, 512]
-        # output = self.classifier(output)       #[1, 9, 512, 512]
-
-        output = self.upsamplerX2(fpn_outs)    #[1, 512, 512, 512]
-        output = self.classifier(output)       #[1, 9, 512, 512]
-
-        return output
+        return logits, feat_map
 
 
 class UperNetFCNHead(nn.Module):
@@ -450,10 +445,7 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
             pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
         )
         features = outputs.feature_maps
-
-        logits = self.decode_head(features)
-        # logits = nn.functional.interpolate(logits, size=pixel_values.shape[2:], mode="bilinear", align_corners=False)
-        #chenhao
+        logits, _ = self.decode_head(features) #feat_map: [b, 128, 512, 512]
 
         auxiliary_logits = None
         if self.auxiliary_head is not None:
@@ -488,7 +480,25 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
             attentions=outputs.attentions,
         )
     
-    def get_feature_map(
+    def get_feature_map_highlevel(
+        self,
+        pixel_values,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ):
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+
+        outputs = self.backbone.forward_with_filtered_kwargs(
+            pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+        )
+        features = outputs.feature_maps
+        _, feat_map = self.decode_head(features)
+        return feat_map
+    
+    def get_feature_map_lowlevel(
         self,
         pixel_values,
         stage_index,
@@ -504,5 +514,4 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
             pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
         )
         features = outputs.feature_maps
-
         return features[stage_index]
