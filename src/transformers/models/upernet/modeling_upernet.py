@@ -252,7 +252,7 @@ class UperNetHead(nn.Module):
 
         feat_map = self.fpn_bottleneck(fpn_outs)    #[1, 512, 256, 256]
         feat_map = self.upsamplerX2(feat_map)       #[1, 128, 512, 512]
-        logits = self.classifier1(feat_map)         #[1, 128, 512, 512]
+        logits = self.classifier1(feat_map)         #[1, 64, 512, 512]
         logits = self.classifier2(logits)           #[1, 9, 512, 512]
 
         return logits, feat_map
