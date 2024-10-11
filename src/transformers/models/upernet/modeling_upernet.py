@@ -26,8 +26,16 @@ from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward
 from ...utils.backbone_utils import load_backbone
 from .configuration_upernet import UperNetConfig
 
-import numpy as np
+import os
 import cv2
+import numpy as np
+import torch.distributed as dist
+import torch.nn.functional as F
+from einops import rearrange, repeat
+from libmy.libproto.models.modules.contrast import momentum_update, l2_normalize
+from libmy.libproto.models.modules.sinkhorn import distributed_sinkhorn
+from libmy.libproto.loss.loss_proto import PixelPrototypeCELoss
+from libmy.libproto.utils.tools.configer import Configer
 
 
 # General docstring
@@ -122,20 +130,6 @@ class UperNetPyramidPoolingModule(nn.Module):
             )
             ppm_outs.append(upsampled_ppm_out)
         return ppm_outs
-
-
-
-# class Upsample(nn.Module):
-#     def __init__(self, num_features) -> None:
-#         super().__init__()
-
-#         self.convolution = nn.Conv2d(num_features, num_features, 3, 1, 1)
-#         self.pixelshuffle = nn.PixelShuffle(2)
-    
-#     def forward(self, hidden_state):
-#         hidden_state = self.convolution(hidden_state)
-#         hidden_state = self.pixelshuffle(hidden_state)
-#         return hidden_state
 
 
 class PixelShuffleUpsampler(nn.Module):
@@ -392,7 +386,8 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
 
         # Semantic segmentation head(s)
         self.decode_head = UperNetHead(config, in_channels=self.backbone.channels)
-        self.auxiliary_head = UperNetFCNHead(config) if config.use_auxiliary_head else None
+        # self.auxiliary_head = UperNetFCNHead(config) if config.use_auxiliary_head else None
+        self.auxiliary_head = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -400,6 +395,65 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         self.loss_t1 = nn.CrossEntropyLoss()
         self.loss_t2 = nn.CrossEntropyLoss()
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        # Coarse prototypes
+        self.n_c_cls = 9
+        self.n_c_pt  = 10
+        in_channels  = 128
+        self.c_pts = torch.nn.Parameter(
+                            torch.zeros(
+                                self.n_c_cls, 
+                                self.n_c_pt,
+                                in_channels
+                            ),#.cuda(), 
+                            requires_grad=False)
+        nn.init.trunc_normal_(self.c_pts, std=0.02)
+        self.c_mask_norm = torch.nn.LayerNorm(self.n_c_cls)#.cuda()
+
+        # Fine prototypes
+        self.n_f_cls = 43
+        self.n_f_pt  = 10
+        in_channels  = 128
+        self.f_pts = torch.nn.Parameter(
+                            torch.zeros(
+                                self.n_f_cls, 
+                                self.n_f_pt,
+                                in_channels
+                            ),#.cuda(), 
+                            requires_grad=False)
+        nn.init.trunc_normal_(self.f_pts, std=0.02)
+        self.f_mask_norm = torch.nn.LayerNorm(self.n_f_cls)#.cuda()
+
+        self.feat_norm = torch.nn.LayerNorm(in_channels)#.cuda()
+        self.gamma = 0.999
+
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+
+        configer = Configer(configs=os.path.join(current_dir, 'H_48_D_4_proto_coarse.json'))
+        self.c_pixel_loss = PixelPrototypeCELoss(configer=configer)
+        # self.c_pixel_loss = self.c_pixel_loss.cuda()
+
+        configer = Configer(configs=os.path.join(current_dir,'H_48_D_4_proto_fine.json'))
+        self.f_pixel_loss = PixelPrototypeCELoss(configer=configer)
+        # self.f_pixel_loss = self.f_pixel_loss.cuda()
+
+        self.ppc_loss_weight = 1.0
+        self.ppd_loss_weight = 1.0
+        self.seg_loss_weight = 1.0
+        self.ps_loss_weight  = 1.0
+
+        self.c2f_map = [
+            [0, 1],
+            [2, 3],
+            [4, 5, 6],
+            [7, 8, 9, 10, 11, 12, 13],
+            [14, 15, 16, 17, 18, 19],
+            [20, 21, 22, 23, 24, 25],
+            [26, 27, 28],
+            [29, 30, 31, 32, 33, 34, 35, 36],
+            [37, 38, 39, 40, 41, 42],  
+        ]
 
     @add_start_docstrings_to_model_forward(UPERNET_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=SemanticSegmenterOutput, config_class=_CONFIG_FOR_DOC)
@@ -449,24 +503,8 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         [1, 150, 512, 512]
         ```"""
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            lab_img, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        logits, _ = self.decode_head(features) #feat_map: [b, 128, 512, 512]
-
-        auxiliary_logits = None
-        if self.auxiliary_head is not None:
-            auxiliary_logits = self.auxiliary_head(features)
-            auxiliary_logits = nn.functional.interpolate(
-                auxiliary_logits, size=lab_img.shape[2:], mode="bilinear", align_corners=False
-            )
+        logits, _ = self._get_fmap(lab_img, output_attentions, output_hidden_states, return_dict) 
+        # logits: [b, 9, 512, 512], fmap: [b, 128, 512, 512]
 
         loss = None
         if lab_ann is not None:
@@ -476,25 +514,12 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
                 # compute weighted loss
                 loss_fct = CrossEntropyLoss(ignore_index=self.config.loss_ignore_index)
                 loss = loss_fct(logits, lab_ann)
-                if auxiliary_logits is not None:
-                    auxiliary_loss = loss_fct(auxiliary_logits, lab_ann)
-                    loss += self.config.auxiliary_loss_weight * auxiliary_loss
-
 
         # ================================================================================
         # Unsupervised learning
         # ================================================================================
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        _, t1_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
-
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            tile2, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        _, t2_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
+        _, t1_fm = self._get_fmap(tile1, output_attentions, output_hidden_states, return_dict)
+        _, t2_fm = self._get_fmap(tile2, output_attentions, output_hidden_states, return_dict)
 
         batch_size = tile1.shape[0]
         tensor_device = tile1.device
@@ -545,8 +570,8 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         return SemanticSegmenterOutput(
             loss=loss,
             logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            hidden_states=None,
+            attentions=None,
         )
     
 
@@ -598,7 +623,6 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
             pixel_values, output_hidden_states=output_hidden_states, output_attentions=output_attentions
         )
         features = outputs.feature_maps
-
         logits, _ = self.decode_head(features)
 
         auxiliary_logits = None
@@ -669,3 +693,342 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         )
         features = outputs.feature_maps
         return features[stage_index]
+
+
+    def _get_fmap(
+            self,
+            img, 
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+        ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+
+        outputs = self.backbone.forward_with_filtered_kwargs(
+            img, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+        )
+        features = outputs.feature_maps
+        logits, fmap = self.decode_head(features) #feat_map: [b, 128, 512, 512]
+        return logits, fmap
+
+    def get_sup_loss(self, c_img, c_lab, f_img, f_lab, 
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+        ):
+        '''
+            用在训练时 teacher-model
+        '''
+        # c_img:  [bs, 3, h, w]
+        # c_lab:  [bs, 1, h, w]
+        # f_img:  [bs, 3, h, w]
+        # f_lab:  [bs, 1, h, w]
+
+        _, c_emb = self._get_fmap(c_img, output_attentions, output_hidden_states, return_dict)
+        # _, f_emb = self._get_fmap(f_img, output_attentions, output_hidden_states, return_dict)
+
+        total_losses = dict()
+
+        # prototype-loss
+        losses = self.get_c_pt_loss(c_emb, c_lab)
+        total_losses.update(losses)
+        # losses = self.get_f_pt_loss(f_emb, f_lab)
+        # total_losses.update(losses)
+        # losses = self.get_c2f_pt_loss(c_emb, c_lab)
+        # total_losses.update(losses)
+        # losses = self.get_f2c_pt_loss(f_emb, f_lab)
+        # total_losses.update(losses)
+        return total_losses
+
+    def get_f2c_pt_loss(self, img_emb, img_labels):
+        '''
+            img_emb: [bs, nc, h, w]
+            img_labels: [b, h, w], 15-class
+        '''
+
+        b, nc, h, w = img_emb.shape
+
+        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
+        _c = self.feat_norm(_c)
+        _c = l2_normalize(_c)
+
+        self.c_pts.data.copy_(l2_normalize(self.c_pts))
+
+        # n: h*w, k: num_class, m: num_prototype
+        masks = torch.einsum('nd,kmd->nmk', _c, self.c_pts) #[bhw, m, k]
+
+        out_seg = torch.amax(masks, dim=1) #[bhw, k]
+        out_seg = self.c_mask_norm(out_seg)
+        out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
+        
+        f2c = torch.tensor(
+            [0,0, 1,1, 2,2,2, 3,3,3,3,3,3,3, 4,4,4,4,4,4, 5,5,5,5,5,5, 6,6,6, 7,7,7,7,7,7,7,7, 8,8,8,8,8,8], 
+            dtype=img_labels.dtype, 
+            device=img_labels.device
+        )
+        f2c_map = torch.ones(256, dtype=img_labels.dtype, device=img_labels.device) * 255
+        f2c_map[:43] = f2c
+
+        img_labels = f2c_map[img_labels] #[0,14] => [0,4] classes
+        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._c_pt_learning(_c, out_seg, gt_seg, masks, update_prototype=False)
+        outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
+        
+        self.c_pixel_loss.train()
+        loss = self.c_pixel_loss(outputs, img_labels.squeeze(1))
+        return {
+                'f2c_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+                'f2c_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+                'f2c_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+        }
+
+    def get_c2f_pt_loss(self, img_emb, img_labels):
+        '''
+            img_emb: [bs, nc, h, w]
+            img_labels: [bs, 1, h, w]
+        '''
+        b, nc, h, w = img_emb.shape
+
+        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
+        _c = self.feat_norm(_c)
+        _c = l2_normalize(_c)
+
+        self.f_pts.data.copy_(l2_normalize(self.f_pts))
+
+        # n: h*w, k: num_class, m: num_prototype
+        masks = torch.einsum('nd,kmd->nmk', _c, self.f_pts) #[bhw, m, k]
+
+        out_seg = list()
+        for k in range(self.n_c_cls):
+            _seg = masks[..., self.c2f_map[k]] #[bhw, m, x]
+            _seg = rearrange(_seg, 'n m x -> n (m x)') #[bhw, mx]
+            _seg = torch.amax(_seg, dim=1) #[bhw]
+            out_seg.append(_seg)
+        out_seg = torch.stack(out_seg, dim=-1) #[bhw, k]
+        out_seg = self.c_mask_norm(out_seg)
+        out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
+
+        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._c2f_pt_learning(_c, out_seg, gt_seg, masks)
+        outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
+        
+        self.c_pixel_loss.train()
+        loss = self.c_pixel_loss(outputs, img_labels.squeeze(1))
+        return {
+                'c2f_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+                'c2f_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+                'c2f_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+        }
+
+    def get_f_pt_loss(self, img_emb, img_labels):
+        '''
+            img_emb: [bs, nc, h, w]
+            img_labels: [bs, 1, h, w]
+        '''
+
+        b, nc, h, w = img_emb.shape
+
+        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
+        _c = self.feat_norm(_c)
+        _c = l2_normalize(_c)
+
+        self.f_pts.data.copy_(l2_normalize(self.f_pts))
+
+        # n: h*w, k: num_class, m: num_prototype
+        masks = torch.einsum('nd,kmd->nmk', _c, self.f_pts) #[bhw, m, k]
+
+        out_seg = torch.amax(masks, dim=1) #[bhw, k]
+        out_seg = self.f_mask_norm(out_seg)
+        out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
+
+        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._f_pt_learning(_c, out_seg, gt_seg, masks, update_prototype=True)
+        outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
+        
+        self.f_pixel_loss.train()
+        loss = self.f_pixel_loss(outputs, img_labels.squeeze(1))
+        return {
+                'fine_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+                'fine_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+                'fine_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+        }
+
+    def get_c_pt_loss(self, img_emb, img_labels):
+        '''
+            img_emb: [bs, nc, h, w]
+            img_labels: [bs, 1, h, w]
+        '''
+
+        b, nc, h, w = img_emb.shape
+
+        _c = rearrange(img_emb, 'b c h w -> (b h w) c')
+        _c = self.feat_norm(_c)
+        _c = l2_normalize(_c)
+
+        self.c_pts.data.copy_(l2_normalize(self.c_pts))
+
+        # n: h*w, k: num_class, m: num_prototype
+        masks = torch.einsum('nd,kmd->nmk', _c, self.c_pts) #[bhw, m, k]
+
+        out_seg = torch.amax(masks, dim=1) #[bhw, k]
+        out_seg = self.c_mask_norm(out_seg)
+        out_seg = rearrange(out_seg, "(b h w) k -> b k h w", b=b, h=h) #[b,k,h,w]
+
+        gt_seg = F.interpolate(img_labels.float(), size=[h, w], mode='nearest').view(-1) #[bhw]
+        contrast_logits, contrast_target = self._c_pt_learning(_c, out_seg, gt_seg, masks, update_prototype=True)
+        outputs = {'seg': out_seg, 'logits': contrast_logits, 'target': contrast_target}
+        
+        self.c_pixel_loss.train()
+        loss = self.c_pixel_loss(outputs, img_labels.squeeze(1))
+        return {
+                'coarse_loss_seg': loss['loss_seg'] * self.seg_loss_weight,
+                'coarse_loss_ppc': loss['loss_ppc'] * self.ppc_loss_weight,
+                'coarse_loss_ppd': loss['loss_ppd'] * self.ppd_loss_weight,
+        }
+
+    def _c_pt_learning(self, _c, out_seg, gt_seg, masks, update_prototype):
+        '''
+            _c:      [bhw, c]
+            out_seg: [b, k, h, w]
+            gt_seg:  [bhw]
+            masks:   [bhw, m, k]
+        '''
+        pred_seg = torch.max(out_seg, 1)[1]
+        mask = (gt_seg == pred_seg.view(-1))
+
+        cosine_similarity = torch.mm(_c, self.c_pts.view(-1, self.c_pts.shape[-1]).t())
+
+        proto_logits = cosine_similarity
+        proto_target = gt_seg.clone().float()
+
+        # clustering for each class
+        protos = self.c_pts.data.clone()
+        for k in range(self.n_c_cls):
+            init_q = masks[..., k]
+            init_q = init_q[gt_seg == k, ...]
+            if init_q.shape[0] == 0:
+                continue
+
+            q, indexs = distributed_sinkhorn(init_q)
+
+            m_k = mask[gt_seg == k]
+            c_k = _c[gt_seg == k, ...]
+
+            m_k_tile = repeat(m_k, 'n -> n tile', tile=self.n_c_pt)
+            m_q = q * m_k_tile  # n x self.num_prototype
+
+            c_k_tile = repeat(m_k, 'n -> n tile', tile=c_k.shape[-1])
+            c_q = c_k * c_k_tile  # n x embedding_dim
+
+            f = m_q.transpose(0, 1) @ c_q  # self.num_prototype x embedding_dim
+
+            n = torch.sum(m_q, dim=0)
+
+            if torch.sum(n) > 0 and update_prototype is True:
+                f = F.normalize(f, p=2, dim=-1)
+
+                new_value = momentum_update(
+                                old_value=protos[k, n != 0, :], 
+                                new_value=f[n != 0, :],
+                                momentum=self.gamma, 
+                                debug=False
+                            )
+                protos[k, n != 0, :] = new_value
+
+            proto_target[gt_seg == k] = indexs.float() + (self.n_c_pt * k)
+
+        self.c_pts = torch.nn.Parameter(l2_normalize(protos), requires_grad=False)
+
+        if dist.is_available() and dist.is_initialized():
+            protos = self.c_pts.data.clone()
+            dist.all_reduce(protos.div_(dist.get_world_size()))
+            self.c_pts = torch.nn.Parameter(protos, requires_grad=False)
+
+        return proto_logits, proto_target
+
+    def _f_pt_learning(self, _c, out_seg, gt_seg, masks, update_prototype):
+        '''
+            _c:      [bhw, c]
+            out_seg: [b, k, h, w]
+            gt_seg:  [bhw]
+            masks:   [bhw, m, k]
+        '''
+        pred_seg = torch.max(out_seg, 1)[1]
+        mask = (gt_seg == pred_seg.view(-1)) #[bhw]
+
+        cosine_similarity = torch.mm(_c, self.f_pts.view(-1, self.f_pts.shape[-1]).t())
+        proto_logits = cosine_similarity #[bhw, mk]
+        proto_target = gt_seg.clone().float()
+
+        # clustering for each class
+        protos = self.f_pts.data.clone()
+        for k in range(self.n_f_cls):
+            init_q = masks[..., k] #[bhw, m]
+            init_q = init_q[gt_seg == k, ...] #[n, m]
+            if init_q.shape[0] == 0:
+                continue
+
+            q, indexs = distributed_sinkhorn(init_q) # q:[n, 10]
+
+            m_k = mask[gt_seg == k]     #[n]: 0 or 1, false negative or true positive
+            c_k = _c[gt_seg == k, ...]  #[n, c]
+
+            m_k_tile = repeat(m_k, 'n -> n tile', tile=self.n_f_pt) #[n, 10]
+            m_q = q * m_k_tile  # n x self.num_prototype (10)
+
+            c_k_tile = repeat(m_k, 'n -> n tile', tile=c_k.shape[-1])
+            c_q = c_k * c_k_tile  # n x embedding_dim (128)
+
+            f = m_q.transpose(0, 1) @ c_q  # self.num_prototype x embedding_dim
+
+            n = torch.sum(m_q, dim=0) #[10]
+
+            if torch.sum(n) > 0 and update_prototype is True:
+                f = F.normalize(f, p=2, dim=-1)
+
+                new_value = momentum_update(
+                                old_value=protos[k, n != 0, :], 
+                                new_value=f[n != 0, :],
+                                momentum=self.gamma, 
+                                debug=False
+                            )
+                protos[k, n != 0, :] = new_value
+
+            proto_target[gt_seg == k] = indexs.float() + (self.n_f_pt * k)
+
+        self.f_pts = torch.nn.Parameter(l2_normalize(protos), requires_grad=False)
+
+        if dist.is_available() and dist.is_initialized():
+            protos = self.f_pts.data.clone()
+            dist.all_reduce(protos.div_(dist.get_world_size()))
+            self.f_pts = torch.nn.Parameter(protos, requires_grad=False)
+
+        return proto_logits, proto_target
+    
+    def _c2f_pt_learning(self, _c, out_seg, gt_seg, masks):
+        '''
+            _c:      [bhw, 128]
+            out_seg: [b, 15, h, w]
+            gt_seg:  [bhw], 5-class
+            masks:   [bhw, m, k], k=15
+        '''
+        cosine_similarity = torch.mm(_c, self.f_pts.view(-1, self.f_pts.shape[-1]).t())
+        proto_logits = cosine_similarity #[bhw, km]
+        proto_target = gt_seg.clone().float()
+
+        for k in range(self.n_c_cls): # 这里是关键  pt数量变了
+
+            init_q = masks[..., self.c2f_map[k]] #[bhw, m, x]
+            init_q = rearrange(init_q, 'n m x -> n (m x)') #[bhw, mx]
+            init_q = init_q[gt_seg == k, ...] #[n, xm]
+            if init_q.shape[0] == 0:
+                continue
+
+            q, indexs = distributed_sinkhorn(init_q)
+            proto_target[gt_seg == k] = indexs.float() + (self.n_f_pt * self.c2f_map[k][0])
+
+        return proto_logits, proto_target
