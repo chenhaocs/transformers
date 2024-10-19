@@ -28,6 +28,7 @@ from .configuration_upernet import UperNetConfig
 
 import numpy as np
 import cv2
+import warnings
 
 
 # General docstring
@@ -525,6 +526,10 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
                 roi = (overlap_msk == id)
                 t1_fvs.append(t1[roi].mean(dim=0)) #[128]
                 t2_fvs.append(t2[roi].mean(dim=0))
+
+            if (len(t1_fvs) == 0) or (len(t2_fvs) == 0): 
+                warnings.warn('(len(t1_fvs) == 0) or (len(t2_fvs) == 0)', UserWarning)
+                continue
 
             t1_fvs = torch.stack(t1_fvs, dim=0) #[n, 128]
             t2_fvs = torch.stack(t2_fvs, dim=0)
