@@ -27,8 +27,8 @@ from ...utils.backbone_utils import load_backbone
 from .configuration_upernet import UperNetConfig
 
 import numpy as np
-import cv2
 import warnings
+import random
 
 
 # General docstring
@@ -456,97 +456,104 @@ class UperNetForSemanticSegmentation(UperNetPreTrainedModel):
         )
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
 
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            lab_img, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        logits, _ = self.decode_head(features) #feat_map: [b, 128, 512, 512]
+        loss = 0
+        logits = 0
 
-        auxiliary_logits = None
-        if self.auxiliary_head is not None:
-            auxiliary_logits = self.auxiliary_head(features)
-            auxiliary_logits = nn.functional.interpolate(
-                auxiliary_logits, size=lab_img.shape[2:], mode="bilinear", align_corners=False
+        if random.random() > 0.5:
+            # ================================================================================
+            # Supervised learning
+            # ================================================================================
+            outputs = self.backbone.forward_with_filtered_kwargs(
+                lab_img, output_hidden_states=output_hidden_states, output_attentions=output_attentions
             )
+            features = outputs.feature_maps
+            logits, _ = self.decode_head(features) #feat_map: [b, 128, 512, 512]
 
-        loss = None
-        if lab_ann is not None:
-            if self.config.num_labels == 1:
-                raise ValueError("The number of labels should be greater than one")
-            else:
-                # compute weighted loss
-                loss_fct = CrossEntropyLoss(ignore_index=self.config.loss_ignore_index)
-                loss = loss_fct(logits, lab_ann)
-                if auxiliary_logits is not None:
-                    auxiliary_loss = loss_fct(auxiliary_logits, lab_ann)
-                    loss += self.config.auxiliary_loss_weight * auxiliary_loss
+            auxiliary_logits = None
+            if self.auxiliary_head is not None:
+                auxiliary_logits = self.auxiliary_head(features)
+                auxiliary_logits = nn.functional.interpolate(
+                    auxiliary_logits, size=lab_img.shape[2:], mode="bilinear", align_corners=False
+                )
 
+            if lab_ann is not None:
+                if self.config.num_labels == 1:
+                    raise ValueError("The number of labels should be greater than one")
+                else:
+                    # compute weighted loss
+                    loss_fct = CrossEntropyLoss(ignore_index=self.config.loss_ignore_index)
+                    loss = loss_fct(logits, lab_ann)
+                    if auxiliary_logits is not None:
+                        auxiliary_loss = loss_fct(auxiliary_logits, lab_ann)
+                        loss += self.config.auxiliary_loss_weight * auxiliary_loss
 
-        # ================================================================================
-        # Unsupervised learning
-        # ================================================================================
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        _, t1_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
+        else:
+            # ================================================================================
+            # Consistent-contrastive learning
+            # ================================================================================
+            outputs = self.backbone.forward_with_filtered_kwargs(
+                tile1, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+            )
+            features = outputs.feature_maps
+            _, t1_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
 
-        outputs = self.backbone.forward_with_filtered_kwargs(
-            tile2, output_hidden_states=output_hidden_states, output_attentions=output_attentions
-        )
-        features = outputs.feature_maps
-        _, t2_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
+            outputs = self.backbone.forward_with_filtered_kwargs(
+                tile2, output_hidden_states=output_hidden_states, output_attentions=output_attentions
+            )
+            features = outputs.feature_maps
+            _, t2_fm = self.decode_head(features) #feat_map (fm): [b, 128, 512, 512]
 
-        batch_size = tile1.shape[0]
-        tensor_device = tile1.device
+            batch_size = tile1.shape[0]
+            tensor_device = tile1.device
 
-        for b in range(batch_size):
+            for b in range(batch_size):
 
-            w, h = overlap_wh[b].to(torch.int32)
-            x, y = overlap_upleft_xy_in_t1[b].to(torch.int32)
-            t1 = t1_fm[b, :, y:y+h, x:x+w] # [128, h, w]
+                w, h = overlap_wh[b].to(torch.int32)
+                x, y = overlap_upleft_xy_in_t1[b].to(torch.int32)
+                t1 = t1_fm[b, :, y:y+h, x:x+w] # [128, h, w]
 
-            overlap_msk = tile1_msk[b, y:y+h, x:x+w] # [h, w]
+                overlap_msk = tile1_msk[b, y:y+h, x:x+w] # [h, w]
 
-            x, y = overlap_upleft_xy_in_t2[b].to(torch.int32)
-            t2 = t2_fm[b, :, y:y+h, x:x+w] # [128, h, w]
+                x, y = overlap_upleft_xy_in_t2[b].to(torch.int32)
+                t2 = t2_fm[b, :, y:y+h, x:x+w] # [128, h, w]
 
-            assert t1.shape[1:] == t2.shape[1:]
+                assert t1.shape[1:] == t2.shape[1:]
 
-            t1 = t1.permute(1, 2, 0) # [h, w, 128]
-            t2 = t2.permute(1, 2, 0) # [h, w, 128]
+                t1 = t1.permute(1, 2, 0) # [h, w, 128]
+                t2 = t2.permute(1, 2, 0) # [h, w, 128]
 
-            t1_fvs = list() # feature vectors (fvs)
-            t2_fvs = list()
+                t1_fvs = list() # feature vectors (fvs)
+                t2_fvs = list()
 
-            obj_ids = overlap_msk.unique()
-            for id in obj_ids:
-                if id == 0: continue
+                obj_ids = overlap_msk.unique()
+                for id in obj_ids:
+                    if id == 0: continue
 
-                roi = (overlap_msk == id)
-                t1_fvs.append(t1[roi].mean(dim=0)) #[128]
-                t2_fvs.append(t2[roi].mean(dim=0))
+                    roi = (overlap_msk == id)
+                    t1_fvs.append(t1[roi].mean(dim=0)) #[128]
+                    t2_fvs.append(t2[roi].mean(dim=0))
 
-            if (len(t1_fvs) == 0) or (len(t2_fvs) == 0): 
-                warnings.warn('(len(t1_fvs) == 0) or (len(t2_fvs) == 0)', UserWarning)
-                continue
+                if (len(t1_fvs) == 0) or (len(t2_fvs) == 0): 
+                    # warnings.warn('(len(t1_fvs) == 0) or (len(t2_fvs) == 0)', UserWarning)
+                    print('** Warning: (len(t1_fvs) == 0) or (len(t2_fvs) == 0)')
+                    continue
 
-            t1_fvs = torch.stack(t1_fvs, dim=0) #[n, 128]
-            t2_fvs = torch.stack(t2_fvs, dim=0)
+                t1_fvs = torch.stack(t1_fvs, dim=0) #[n, 128]
+                t2_fvs = torch.stack(t2_fvs, dim=0)
 
-            # normalized features
-            t1_fvs = t1_fvs / t1_fvs.norm(dim=1, keepdim=True) #[n, 128]
-            t2_fvs = t2_fvs / t2_fvs.norm(dim=1, keepdim=True)
+                # normalized features
+                t1_fvs = t1_fvs / t1_fvs.norm(dim=1, keepdim=True) #[n, 128]
+                t2_fvs = t2_fvs / t2_fvs.norm(dim=1, keepdim=True)
 
-            # cosine similarity as logits
-            logit_scale = self.logit_scale.exp()
-            logits_per_t1 = logit_scale * t1_fvs @ t2_fvs.t() #[n, n]
-            logits_per_t2 = logits_per_t1.t()
+                # cosine similarity as logits
+                logit_scale = self.logit_scale.exp()
+                logits_per_t1 = logit_scale * t1_fvs @ t2_fvs.t() #[n, n]
+                logits_per_t2 = logits_per_t1.t()
 
-            b_labels = torch.arange(t1_fvs.shape[0], dtype=torch.long, device=tensor_device)
-            b_loss = (self.loss_t1(logits_per_t1, b_labels) + self.loss_t2(logits_per_t2, b_labels))/2
-            loss += b_loss
-
+                b_labels = torch.arange(t1_fvs.shape[0], dtype=torch.long, device=tensor_device)
+                b_loss = (self.loss_t1(logits_per_t1, b_labels) + self.loss_t2(logits_per_t2, b_labels))/2
+                loss += b_loss
+            
         return SemanticSegmenterOutput(
             loss=loss,
             logits=logits,
